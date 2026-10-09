@@ -260,14 +260,25 @@ class PortfolioBotRunner:
     history_bars: int = 1500
     min_order_value: float = 10.0
 
-    def target_weights(self) -> dict[str, float] | None:
-        start = pd.Timestamp.now(tz="UTC") - interval_to_timedelta(self.interval) * (self.history_bars + 2)
+    def target_weights(self, initial_sync: bool = False) -> dict[str, float] | None:
+        """Target weights decided at the last closed candle; None if no rebalance is due.
+        With ``initial_sync`` (empty account) the most recent decision is adopted right away."""
+        now = pd.Timestamp.now(tz="UTC")
+        step = interval_to_timedelta(self.interval)
+        start = now - step * (self.history_bars + 2)
         panel = {s: fetch_klines(s, self.interval, start=start) for s in self.symbols}
-        panel = {s: df for s, df in panel.items() if len(df) > 300}
+        # skip coins without enough history or whose data stopped (delisted / halted)
+        panel = {s: df for s, df in panel.items() if len(df) > 300 and df.index[-1] >= now - 3 * step}
+        if not panel:
+            log.warning("no symbol with fresh data - skipping this cycle")
+            return None
         w = self.strategy.weights(panel, self.interval)
         row = w.iloc[-1]
         if row.isna().all():
-            return None  # no rebalance scheduled at this candle
+            decided = w.dropna(how="all")
+            if not initial_sync or decided.empty:
+                return None  # no rebalance scheduled at this candle
+            row = decided.iloc[-1]
         row = row.fillna(0.0).clip(lower=0.0)
         if row.sum() > 1.0:
             row = row / row.sum()
@@ -278,7 +289,7 @@ class PortfolioBotRunner:
         bal = self.broker.balances()
         holdings = {s: bal.get(self.broker.base_asset(s), 0.0) * prices[s] for s in self.symbols}
         total = bal.get(self.broker.quote, 0.0) + sum(holdings.values())
-        target = self.target_weights()
+        target = self.target_weights(initial_sync=sum(holdings.values()) < self.min_order_value)
         report = {"_equity": total, "_rebalanced": target is not None}
         if target is None or total <= 0:
             return report

@@ -7,6 +7,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.dates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -19,6 +20,8 @@ FIGURES = REPORTS / "figures"
 # Palette (light theme): categorical slots in fixed order + chart chrome.
 SLOTS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
 SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
+DISPLAY_NAMES = {"buy_hold": "Buy & Hold"}
+INACTIVE_EXPOSURE = 0.02  # bots invested less than 2 % of the time are flagged/hidden in rankings
 FAMILY_COLORS = {
     "trend": SLOTS[0], "breakout": SLOTS[1], "mean_reversion": SLOTS[2], "ml": SLOTS[3],
     "bot": SLOTS[4], "benchmark": SLOTS[5], "ensemble": SLOTS[6],
@@ -49,9 +52,10 @@ def _fig(w=10, h=5.5):
 
 
 def _title(ax, title, subtitle=None):
-    ax.set_title(title, loc="left", fontsize=13, color=INK, pad=24 if subtitle else 10, fontweight="bold")
+    ax.set_title(title, loc="left", fontsize=13, color=INK, pad=26 if subtitle else 10, fontweight="bold")
     if subtitle:
-        ax.text(0, 1.02, subtitle, transform=ax.transAxes, fontsize=9.5, color=INK2, va="bottom")
+        ax.annotate(subtitle, xy=(0, 1), xycoords="axes fraction", xytext=(0, 8), textcoords="offset points",
+                    fontsize=9.5, color=INK2, va="bottom", ha="left")
 
 
 def plot_equity(series: dict[str, pd.Series], path: Path, title: str, subtitle: str | None = None,
@@ -59,17 +63,35 @@ def plot_equity(series: dict[str, pd.Series], path: Path, title: str, subtitle: 
     fig, ax = _fig(10, 5.5)
     _style(ax, "both")
     colors = colors or {}
+    ends = []
     for k, (label, s) in enumerate(series.items()):
         s = s.dropna()
         if s.empty:
             continue
         s = s / s.iloc[0]
         c = colors.get(label, SLOTS[k % len(SLOTS)])
-        ax.plot(s.index, s.values, color=c, linewidth=2 if k == 0 else 1.6, label=label, zorder=3 - 0.1 * k)
-        ax.annotate(f"{label}  {s.iloc[-1]:.1f}x", (s.index[-1], s.iloc[-1]), xytext=(6, 0),
-                    textcoords="offset points", fontsize=8.5, color=INK2, va="center")
+        ax.plot(s.index, s.values, color=c, linewidth=2.2 if k == 0 else 1.5, label=label, zorder=3 - 0.1 * k)
+        ends.append((float(s.iloc[-1]), s.index[-1], _de(f"{s.iloc[-1]:.1f}x"), c))
     ax.set_yscale("log")
-    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}x"))
+    # end-of-line value labels, pushed apart so they never overlap (log space)
+    if ends:
+        lo, hi = ax.get_ylim()
+        span = np.log10(hi) - np.log10(lo)
+        gap = 0.045 * span
+        ends.sort(key=lambda e: e[0])
+        ys = [np.log10(e[0]) for e in ends]
+        for i in range(1, len(ys)):
+            ys[i] = max(ys[i], ys[i - 1] + gap)
+        fig.canvas.draw()
+        for (val, x, text, c), y in zip(ends, ys):
+            xd = matplotlib.dates.date2num(x)
+            p0 = ax.transData.transform((xd, val))
+            p1 = ax.transData.transform((xd, 10 ** y))
+            dy = (p1[1] - p0[1]) * 72.0 / fig.dpi
+            ax.annotate(text, (x, val), xytext=(9, dy), textcoords="offset points", fontsize=8.5, color=INK2,
+                        va="center", ha="left", annotation_clip=False)
+            ax.plot([x], [val], marker="o", markersize=4.5, color=c, zorder=4)
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: _de(f"{v:g}x")))
     if split:
         ts = pd.Timestamp(split, tz="UTC")
         ax.axvline(ts, color=AXIS, linewidth=1)
@@ -86,7 +108,7 @@ def plot_equity(series: dict[str, pd.Series], path: Path, title: str, subtitle: 
 
 def plot_metric_bars(summary: pd.DataFrame, metric: str, path: Path, title: str, subtitle: str | None = None,
                      fmt: str = "{:.2f}", highlight: tuple[str, ...] = ()) -> Path:
-    df = summary.sort_values(metric)
+    df = summary[summary["exposure"] >= INACTIVE_EXPOSURE].sort_values(metric)
     h = max(4.0, 0.22 * len(df) + 1.2)
     fig, ax = _fig(9, h)
     _style(ax, "x")
@@ -101,8 +123,9 @@ def plot_metric_bars(summary: pd.DataFrame, metric: str, path: Path, title: str,
         if name in highlight:
             tick.set_fontweight("bold")
             tick.set_color(INK)
+    ax.xaxis.set_major_formatter(_DE_TICKS)
     for yi, v in zip(y, df[metric]):
-        ax.text(v + (0.01 if v >= 0 else -0.01) * (abs(df[metric]).max() or 1), yi, fmt.format(v),
+        ax.text(v + (0.01 if v >= 0 else -0.01) * (abs(df[metric]).max() or 1), yi, _de(fmt.format(v)),
                 va="center", ha="left" if v >= 0 else "right", fontsize=7.5, color=INK2)
     ax.axvline(0, color=AXIS, linewidth=0.8)
     fams = [f for f in FAMILY_COLORS if f in set(df["family"])]
@@ -120,6 +143,7 @@ def plot_risk_return(summary: pd.DataFrame, path: Path, title: str, subtitle: st
     highlight = highlight or {}
     fig, ax = _fig(9, 6)
     _style(ax, "both")
+    summary = summary[summary["exposure"] >= INACTIVE_EXPOSURE]
     base = summary[~summary["strategy"].isin(highlight)]
     ax.scatter(-base["port_maxdd"] * 100, base["port_cagr"] * 100, s=34, color=AXIS, edgecolor=SURFACE,
                linewidth=1.5, zorder=2, label="Andere Bots")
@@ -132,11 +156,14 @@ def plot_risk_return(summary: pd.DataFrame, path: Path, title: str, subtitle: st
         if r.empty:
             continue
         r = r.iloc[0]
+        shown = DISPLAY_NAMES.get(name, name)
         ax.scatter(-r["port_maxdd"] * 100, r["port_cagr"] * 100, s=90, color=color, edgecolor=SURFACE,
-                   linewidth=2, zorder=4, label=name)
-        ax.annotate(name, (-r["port_maxdd"] * 100, r["port_cagr"] * 100), xytext=(7, -3),
+                   linewidth=2, zorder=4, label=shown)
+        ax.annotate(shown, (-r["port_maxdd"] * 100, r["port_cagr"] * 100), xytext=(7, -3),
                     textcoords="offset points", fontsize=9, color=INK, fontweight="bold")
     ax.axhline(0, color=AXIS, linewidth=0.8)
+    ax.xaxis.set_major_formatter(_DE_TICKS)
+    ax.yaxis.set_major_formatter(_DE_TICKS)
     ax.set_xlabel("Maximaler Drawdown (%)", color=INK2, fontsize=9)
     ax.set_ylabel("CAGR (% p.a.)", color=INK2, fontsize=9)
     ax.legend(frameon=False, fontsize=8.5, loc="upper right", labelcolor=INK2)
@@ -166,7 +193,7 @@ def plot_heatmap(matrix: pd.DataFrame, path: Path, title: str, subtitle: str | N
         for j in range(matrix.shape[1]):
             v = vals[i, j]
             if not np.isnan(v):
-                ax.text(j, i, fmt.format(v), ha="center", va="center", fontsize=8.5,
+                ax.text(j, i, _de(fmt.format(v)), ha="center", va="center", fontsize=8.5,
                         color="#ffffff" if abs(v) > 0.6 * lim else INK)
     ax.set_xticks(np.arange(-.5, matrix.shape[1]), minor=True)
     ax.set_yticks(np.arange(-.5, matrix.shape[0]), minor=True)
@@ -202,28 +229,44 @@ def plot_lines(df: pd.DataFrame, path: Path, title: str, xlabel: str, ylabel: st
     return path
 
 
+def _de(text: str) -> str:
+    """German number format: decimal comma, typographic minus."""
+    return text.replace(".", ",").replace("-", "−")
+
+
 def fmt_pct(v: float, digits: int = 1) -> str:
-    return "–" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v * 100:+.{digits}f} %"
+    return "–" if v is None or (isinstance(v, float) and np.isnan(v)) else _de(f"{v * 100:+.{digits}f} %")
 
 
 def fmt_num(v: float, digits: int = 2) -> str:
-    return "–" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.{digits}f}"
+    return "–" if v is None or (isinstance(v, float) and np.isnan(v)) else _de(f"{v:.{digits}f}")
+
+
+_DE_TICKS = matplotlib.ticker.FuncFormatter(lambda v, _: _de(f"{v:g}"))
 
 
 def ranking_table(summary: pd.DataFrame, top: int | None = None) -> str:
     cols = ["#", "Bot", "Familie", "CAGR", "Sharpe", "Max. DD", "Calmar", "Zeit im Markt", "Trades/Jahr",
             "schlägt B&H (Sharpe)"]
     lines = ["| " + " | ".join(cols) + " |", "|" + "|".join(["---"] * len(cols)) + "|"]
-    df = summary.sort_values("port_sharpe", ascending=False)
+    active = summary["exposure"] >= INACTIVE_EXPOSURE
+    df = pd.concat([summary[active].sort_values("port_sharpe", ascending=False),
+                    summary[~active].sort_values("port_sharpe", ascending=False)])
     if top:
         df = df.head(top)
     for k, (_, r) in enumerate(df.iterrows(), 1):
         name = f"**{r['strategy']}**" if r["family"] in ("ensemble", "benchmark") else r["strategy"]
+        if r["exposure"] < INACTIVE_EXPOSURE:
+            name += " †"
         lines.append("| " + " | ".join([
             str(k), name, FAMILY_DE.get(r["family"], r["family"]), fmt_pct(r["port_cagr"]),
             fmt_num(r["port_sharpe"]), fmt_pct(r["port_maxdd"]), fmt_num(r["port_calmar"]),
-            f"{r['exposure'] * 100:.0f} %", f"{r['trades_per_year']:.0f}",
-            f"{r['beat_bh_sharpe'] * 100:.0f} %"]) + " |")
+            f"{r['exposure'] * 100:.0f} %",
+            "–" if pd.isna(r["trades_per_year"]) else f"{r['trades_per_year']:.0f}",
+            "–" if pd.isna(r["beat_bh_sharpe"]) else f"{r['beat_bh_sharpe'] * 100:.0f} %"]) + " |")
+    if (~active).any():
+        lines.append("\n† weniger als 2 % der Zeit investiert – die Kennzahlen beruhen auf sehr wenigen Trades "
+                     "und sind kaum aussagekräftig.")
     return "\n".join(lines)
 
 
@@ -264,6 +307,13 @@ def strategy_catalog() -> str:
     for _, fam, name, s in sorted(rows, key=lambda r: (r[0], r[2])):
         lines.append(f"| `{name}` | {FAMILY_DE.get(fam, fam)} | {s.native_timeframe or '–'} | {s.source} | "
                      f"{s.description} |")
+    from ..portfolio_strategies import PORTFOLIO_REGISTRY
+    lines += ["", "**Portfolio-Bots** (verteilen das Kapital zwischen den Coins):", "",
+              "| Bot | Familie | Vorbild / Quelle | Logik |", "|---|---|---|---|"]
+    for name, make in PORTFOLIO_REGISTRY.items():
+        p = make()
+        desc = (p.description or (type(p).__doc__ or "").strip().splitlines()[0]).strip()
+        lines.append(f"| `{name}` | {FAMILY_DE.get(p.family, p.family)} | {p.source} | {desc} |")
     return "\n".join(lines)
 
 

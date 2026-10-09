@@ -1,6 +1,6 @@
 # Katalog: alle nachgebauten Bots
 
-Jeder Bot ist in `trading_bot/strategies/` implementiert und besteht den automatischen Look-ahead-Test. Parameter sind die veröffentlichten Standardwerte bzw. die hyperoptimierten Werte aus dem Original.
+Jeder Bot ist in `trading_bot/strategies/` (bzw. `trading_bot/portfolio_strategies.py`) implementiert und besteht den automatischen Look-ahead-Test. Parameter sind die veröffentlichten Standardwerte bzw. die hyperoptimierten Werte aus dem Original. `demo_leaky_tutorial_rf` ist absichtlich fehlerhaft und dient nur zur Demonstration.
 
 | Bot | Familie | Original-Zeitebene | Vorbild / Quelle | Logik |
 |---|---|---|---|---|
@@ -57,4 +57,20 @@ Jeder Bot ist in `trading_bot/strategies/` implementiert und besteht den automat
 | `ml_lorentzian_knn` | ML-Vorhersage | – | TradingView 'Machine Learning: Lorentzian Classification' (jdehorty) - Re-Implementierung | k-NN (k=8) mit Lorentz-Distanz über RSI/WT/CCI/ADX-Features der letzten 2000 Kerzen (jede 4.), Original-Label, Volatilitäts- und Kernel-Filter, 4 Kerzen Haltedauer. |
 | `ml_lstm` | ML-Vorhersage | – | Die populären 'LSTM Bitcoin Price Prediction'-Repos/Tutorials (PyTorch) | LSTM über die letzten 32 Kerzen sagt die nächste Kerzenrichtung voraus; long wenn P(up)>0.5. Skalierung nur auf dem Trainingsfenster. |
 | `ml_random_forest` | ML-Vorhersage | – | GitHub-Klassiker 'Random Forest Stock/Crypto Prediction' (scikit-learn) | Random Forest klassifiziert die nächste Kerze (hoch/runter); long wenn P(up)>0.5. |
-| `demo_leaky_tutorial_rf` | demo | – | Typischer Tutorial-Fehler (train_test_split(shuffle=True), Backtest auf Trainingsdaten) | Abschreckendes Beispiel mit Look-ahead-Bias - nicht handelbar. |
+| `own_v01_all_bots` | Eigener Bot | – | Eigenentwicklung: Online-Auswahl der besten Bots (walk-forward) | v0.1: Mittelwert der Positionen aller regelbasierten Internet-Bots. |
+| `own_v02_follow_best` | Eigener Bot | – | Eigenentwicklung: Online-Auswahl der besten Bots (walk-forward) | v0.2: Folgt monatlich den 3 Bots mit der besten Sharpe der letzten 180 Tage. |
+| `own_v03_slow_trend` | Eigener Bot | – | Eigenentwicklung (Trading-Bot-V1.0) | v0.3: Abstimmung von 7 langsamen Trendregeln (50-200 Tage). |
+| `own_v04_vol_target` | Eigener Bot | – | Eigenentwicklung (Trading-Bot-V1.0) | v0.4: wie v0.3, Positionsgröße per Volatilitäts-Targeting (40 % p.a.). |
+| `own_v05_fast_trend` | Eigener Bot | – | Eigenentwicklung (Trading-Bot-V1.0) | v0.5: Abstimmung von 8 Top-Regeln des Benchmarks (10-52 Tage). |
+| `trend_bot_v1` | Eigener Bot | – | Eigenentwicklung (Trading-Bot-V1.0) | v1.0: voll investiert, solange die Mehrheit (>4 von 8) der Top-Regeln des Benchmarks einen Aufwärtstrend meldet; sonst Cash. |
+| `demo_leaky_tutorial_rf` | Demo (absichtlich fehlerhaft) | – | Typischer Tutorial-Fehler (train_test_split(shuffle=True), Backtest auf Trainingsdaten) | Abschreckendes Beispiel mit Look-ahead-Bias - nicht handelbar. |
+
+**Portfolio-Bots** (verteilen das Kapital zwischen den Coins):
+
+| Bot | Familie | Vorbild / Quelle | Logik |
+|---|---|---|---|
+| `pf_equal_weight` | Buy & Hold | Benchmark | Alle verfügbaren Coins gleich gewichtet, täglich rebalanciert. |
+| `pf_xs_momentum_30d_top5` | Trendfolge | Cross-Sectional Momentum (Liu/Tsyvinski/Wu 2022, 'Rotation-Bots') | Hält die K Coins mit der besten Rendite der letzten N Tage (nur wenn > 0), gleich gewichtet. |
+| `pf_xs_momentum_90d_top5` | Trendfolge | Cross-Sectional Momentum (Liu/Tsyvinski/Wu 2022, 'Rotation-Bots') | Hält die K Coins mit der besten Rendite der letzten N Tage (nur wenn > 0), gleich gewichtet. |
+| `rotation_v0_plain` | Eigener Bot | Eigenentwicklung (Trading-Bot-V1.0): Dual Momentum nach Antonacci, für Krypto adaptiert | Dual Momentum ohne Filter: wöchentlich die 5 Coins mit dem besten 14/30/60-Tage-Momentum (nur bei positivem Momentum), gleich gewichtet. |
+| `rotation_bot_v1` | Eigener Bot | Eigenentwicklung (Trading-Bot-V1.0): Dual Momentum nach Antonacci, für Krypto adaptiert | Wöchentlich die 5 Coins mit dem besten 14/30/60-Tage-Momentum, nur über ihrer 100-Tage-Linie, gewichtet nach umgekehrter Volatilität (max. 35 %); Cash, wenn BTC unter der 200-Tage-Linie. |

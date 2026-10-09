@@ -9,7 +9,7 @@ import sys
 import pandas as pd
 
 from .backtest import Costs
-from .data import DEFAULT_UNIVERSE, load_ohlcv
+from .data import DEFAULT_UNIVERSE, LIVE_UNIVERSE, load_ohlcv
 
 
 def _costs(args) -> Costs:
@@ -89,7 +89,7 @@ def cmd_portfolio(args) -> None:
     w = res.weights.iloc[-1]
     for sym, val in w[w > 0.001].sort_values(ascending=False).items():
         print(f"  {sym:10s} {val:6.1%}")
-    print(f"  Cash       {1 - w.sum():6.1%}")
+    print(f"  Cash       {max(0.0, 1 - w.sum()):6.1%}")
 
 
 def cmd_benchmark(args) -> None:
@@ -118,6 +118,8 @@ def cmd_paper(args) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     is_portfolio = args.strategy in PORTFOLIO_REGISTRY
     strat = get_portfolio_strategy(args.strategy) if is_portfolio else get_strategy(args.strategy)
+    if args.symbols is None:
+        args.symbols = list(LIVE_UNIVERSE) if is_portfolio else ["BTCUSDT", "ETHUSDT"]
     if args.live:
         if not args.i_understand_the_risks:
             sys.exit("Echtgeld-Handel erfordert zusätzlich --i-understand-the-risks.")
@@ -183,8 +185,9 @@ def main(argv: list[str] | None = None) -> None:
     r.set_defaults(func=cmd_report)
 
     pp = sub.add_parser("paper", help="Paper-Trading (Standard) oder Live-Trading starten")
-    pp.add_argument("--strategy", default="trend_bot_v1")
-    pp.add_argument("--symbols", nargs="+", default=["BTCUSDT", "ETHUSDT"])
+    pp.add_argument("--strategy", default="rotation_bot_v1")
+    pp.add_argument("--symbols", nargs="+", default=None,
+                    help="Standard: alle handelbaren Coins (Portfolio-Bots) bzw. BTC+ETH (Einzel-Coin-Bots)")
     pp.add_argument("--interval", default="1d")
     pp.add_argument("--capital", type=float, default=10_000.0)
     pp.add_argument("--name", help="Name der Paper-Session (Zustandsdatei in state/)")

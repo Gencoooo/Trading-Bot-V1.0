@@ -66,7 +66,9 @@ def test_runner_step_rebalances_paper_account(tmp_path, monkeypatch):
 def test_portfolio_runner_rebalances_to_target(tmp_path, monkeypatch):
     from trading_bot.portfolio_strategies import EqualWeightHold
     monkeypatch.setattr(live, "STATE_DIR", tmp_path)
-    data = {"AAAUSDT": DF, "BBBUSDT": synthetic_ohlcv(n=900, interval="1d", seed=12)}
+    start = (pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=899)).strftime("%Y-%m-%d")
+    data = {"AAAUSDT": synthetic_ohlcv(n=900, interval="1d", seed=11, start=start),
+            "BBBUSDT": synthetic_ohlcv(n=900, interval="1d", seed=12, start=start)}
     monkeypatch.setattr(live, "fetch_klines", lambda s, *a, **k: data[s])
     monkeypatch.setattr(live, "latest_price", lambda s: float(data[s]["close"].iloc[-1]))
     broker = live.PaperBroker(name="p", starting_cash=1000.0, costs=Costs(fee=0.0, slippage=0.0))

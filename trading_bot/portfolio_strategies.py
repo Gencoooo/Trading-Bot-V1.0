@@ -15,10 +15,12 @@ from .strategies.ensemble import _bars, trend_votes
 PORTFOLIO_REGISTRY: dict[str, Callable[[], PortfolioStrategy]] = {}
 
 
-def add_portfolio(name: str, cls, **params) -> None:
+def add_portfolio(name: str, cls, description: str | None = None, **params) -> None:
     def make():
         inst = cls(**params)
         inst.name = name
+        if description:
+            inst.description = description
         return inst
     PORTFOLIO_REGISTRY[name] = make
 
@@ -191,3 +193,16 @@ MIX7 = SMA3 + TS3 + [("donchian", 55, 20)]
 add_portfolio("pf_equal_weight", EqualWeightHold)
 add_portfolio("pf_xs_momentum_30d_top5", XSMomentum, lookback_days=30, top_k=5, rebalance_days=7)
 add_portfolio("pf_xs_momentum_90d_top5", XSMomentum, lookback_days=90, top_k=5, rebalance_days=7)
+
+# Own portfolio bot. Parameters were chosen on in-sample data only (2017-08..2023-12) with the
+# pre-registered rule in reports/ERGEBNISSE.md; the plain version is kept to show what the
+# filters add.
+add_portfolio("rotation_v0_plain", MomentumRotation, btc_filter=False,
+              description="Dual Momentum ohne Filter: wöchentlich die 5 Coins mit dem besten 14/30/60-Tage-Momentum "
+                          "(nur bei positivem Momentum), gleich gewichtet.")
+add_portfolio("rotation_bot_v1", MomentumRotation,
+              description="Wöchentlich die 5 Coins mit dem besten 14/30/60-Tage-Momentum, nur über ihrer 100-Tage-Linie, "
+                          "gewichtet nach umgekehrter Volatilität (max. 35 %); Cash, wenn BTC unter der 200-Tage-Linie.",
+              lookbacks=(14, 30, 60), top_k=5, rebalance_days=7,
+              weighting="inv_vol", max_weight=0.35, btc_filter=True, btc_days=200, btc_scale=0.0,
+              trend_days=100)

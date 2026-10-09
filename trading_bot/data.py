@@ -37,6 +37,9 @@ DEFAULT_UNIVERSE = (
     "AVAXUSDT", "BCHUSDT", "DOTUSDT", "MATICUSDT", "WAVESUSDT",
 )
 
+# Coins that are still tradable on Binance (delisted ones removed) - used for paper/live trading.
+LIVE_UNIVERSE = tuple(s for s in DEFAULT_UNIVERSE if s not in ("EOSUSDT", "MATICUSDT", "WAVESUSDT"))
+
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume", "quote_volume", "trades"]

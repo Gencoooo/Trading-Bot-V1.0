@@ -42,6 +42,15 @@ def btc_close_aligned(df: pd.DataFrame, interval: str) -> pd.Series | None:
     return btc["close"].reindex(df.index, method="ffill")
 
 
+def _state(on: pd.Series, off: pd.Series) -> pd.Series:
+    """Latching 0/1 state: switches on when ``on`` fires, off when ``off`` fires."""
+    a, b = on.fillna(False).to_numpy(), off.fillna(False).to_numpy()
+    st = np.zeros(len(a), dtype=bool)
+    for i in range(1, len(a)):
+        st[i] = True if a[i] else (False if b[i] else st[i - 1])
+    return pd.Series(st, index=on.index)
+
+
 def trend_votes(df: pd.DataFrame, interval: str, components: list[tuple]) -> pd.DataFrame:
     """Each component is a 0/1 'trend is up' vote. Lookbacks are given in days."""
     close = df["close"]
@@ -73,6 +82,24 @@ def trend_votes(df: pd.DataFrame, interval: str, components: list[tuple]) -> pd.
         elif kind == "supertrend":
             period = _bars(comp[1], interval)
             votes[f"supertrend{comp[1]}x{comp[2]}"] = ta.supertrend(df, period, comp[2])["direction"] > 0
+        elif kind == "sma_cross":
+            f, s = _bars(comp[1], interval), _bars(comp[2], interval)
+            votes[f"sma{comp[1]}_{comp[2]}"] = ta.sma(close, f) > ta.sma(close, s)
+        elif kind in ("keltner", "bollinger"):
+            # breakout state: on above the upper band, off below the middle line
+            n = _bars(comp[1], interval)
+            if kind == "keltner":
+                bands = ta.keltner(df, n, 2.0, _bars(comp[1] / 2, interval))
+            else:
+                bands = ta.bollinger(close, n, 2.0)
+            votes[f"{kind}{comp[1]}"] = _state(close > bands["upper"], close < bands["mid"])
+        elif kind == "ichimoku":
+            t, k, s = (_bars(x, interval) for x in (comp[1], comp[2], comp[3]))
+            ich = ta.ichimoku(df, t, k, s)
+            top = np.maximum(ich["span_a"], ich["span_b"])
+            bot = np.minimum(ich["span_a"], ich["span_b"])
+            votes[f"ichimoku{comp[1]}"] = _state((close > top) & (ich["tenkan"] > ich["kijun"]),
+                                                 (close < bot) | (ich["tenkan"] < ich["kijun"]))
         else:
             raise ValueError(f"unknown component {kind}")
     out = pd.DataFrame(votes, index=df.index).astype(float)
@@ -147,13 +174,15 @@ class MetaSelector(Strategy):
 
     def __init__(self, candidates=(), lookback_days=180, rebalance_days=30, top_k=3, min_sharpe=0.0,
                  band=0.1, **kw):
-        super().__init__(candidates=list(candidates), lookback_days=lookback_days, rebalance_days=rebalance_days,
+        candidates = candidates if candidates == "zoo" else list(candidates)
+        super().__init__(candidates=candidates, lookback_days=lookback_days, rebalance_days=rebalance_days,
                          top_k=top_k, min_sharpe=min_sharpe, band=band, **kw)
 
     def generate(self, df, interval):
         p = self.params
         n = len(df)
-        runs = [_candidate_run(name, df, interval) for name in p["candidates"]]
+        candidates = _zoo_pool() if p["candidates"] == "zoo" else p["candidates"]
+        runs = [_candidate_run(name, df, interval) for name in candidates]
         E = np.array([r[0] for r in runs])
         R = np.array([r[1] for r in runs])
         lb, step = _bars(p["lookback_days"], interval), _bars(p["rebalance_days"], interval)
@@ -169,3 +198,33 @@ class MetaSelector(Strategy):
             if chosen:
                 target[T:end] = E[chosen, T:end].mean(axis=0)
         return Signals(target=np.clip(target, 0.0, 1.0), min_rebalance=p["band"])
+
+
+# --------------------------------------------------------------------------- #
+# Evolution of the own bot (each step is benchmarked in reports/ERGEBNISSE.md)
+# --------------------------------------------------------------------------- #
+SLOW_TREND = [("sma", 50), ("sma", 100), ("sma", 200), ("tsmom", 30), ("tsmom", 90), ("tsmom", 180),
+              ("donchian", 55, 20)]
+# Eight of the top-12 in-sample rules on 1d (different rule types), lookbacks expressed in days.
+FAST_TREND = [("ema_cross", 12, 26), ("sma_cross", 10, 20), ("donchian", 20, 10), ("tsmom", 30),
+              ("supertrend", 10, 3.0), ("keltner", 20), ("bollinger", 20), ("ichimoku", 9, 26, 52)]
+
+
+def _zoo_pool() -> list[str]:
+    from .base import list_strategies
+    return list_strategies(exclude_families={"ml", "bot", "ensemble", "benchmark"})
+
+
+add("own_v01_all_bots", MetaSelector, candidates="zoo", lookback_days=180, top_k=10_000, min_sharpe=-1e9,
+    description="v0.1: Mittelwert der Positionen aller regelbasierten Internet-Bots.")
+add("own_v02_follow_best", MetaSelector, candidates="zoo", lookback_days=180, top_k=3,
+    description="v0.2: Folgt monatlich den 3 Bots mit der besten Sharpe der letzten 180 Tage.")
+add("own_v03_slow_trend", TrendEnsemble, components=SLOW_TREND,
+    description="v0.3: Abstimmung von 7 langsamen Trendregeln (50-200 Tage).")
+add("own_v04_vol_target", TrendEnsemble, components=SLOW_TREND, vol_target=0.4,
+    description="v0.4: wie v0.3, Positionsgröße per Volatilitäts-Targeting (40 % p.a.).")
+add("own_v05_fast_trend", TrendEnsemble, components=FAST_TREND,
+    description="v0.5: Abstimmung von 8 Top-Regeln des Benchmarks (10-52 Tage).")
+add("trend_bot_v1", TrendEnsemble, components=FAST_TREND, binary=True, threshold=0.5,
+    description="v1.0: voll investiert, solange die Mehrheit (>4 von 8) der Top-Regeln des Benchmarks "
+                "einen Aufwärtstrend meldet; sonst Cash.")

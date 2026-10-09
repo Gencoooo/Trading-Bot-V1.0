@@ -34,6 +34,7 @@ class Strategy:
 
 
 REGISTRY: dict[str, Callable[[], Strategy]] = {}
+FAMILIES: dict[str, str] = {}
 
 
 def add(name: str, cls: type[Strategy], *, description: str | None = None, source: str | None = None,
@@ -54,6 +55,7 @@ def add(name: str, cls: type[Strategy], *, description: str | None = None, sourc
     if name in REGISTRY:
         raise ValueError(f"duplicate strategy name {name!r}")
     REGISTRY[name] = make
+    FAMILIES[name] = family or cls.family
 
 
 def get_strategy(name: str) -> Strategy:
@@ -71,8 +73,8 @@ def list_strategies(families: set[str] | None = None, exclude_families: set[str]
     from . import load_all
     load_all()
     names = []
-    for name, make in REGISTRY.items():
-        fam = make().family
+    for name in REGISTRY:
+        fam = FAMILIES[name]
         if fam == "demo" and not include_demo:
             continue
         if families is not None and fam not in families:
