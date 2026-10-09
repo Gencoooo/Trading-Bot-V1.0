@@ -85,8 +85,12 @@ def cmd_portfolio(args) -> None:
         for key, name, fmt in (("cagr", "CAGR", "{:+.1%}"), ("sharpe", "Sharpe", "{:.2f}"),
                                ("max_drawdown", "Max. Drawdown", "{:.1%}"), ("calmar", "Calmar", "{:.2f}")):
             print(f"{name:16s} {fmt.format(m[key]):>14s} {fmt.format(mb[key]):>14s}")
-    print("\nAktuelle Zielgewichte:")
-    w = res.weights.iloc[-1]
+    # the last decision's targets, i.e. what paper/live trading holds right after its rebalance
+    # (res.weights are the held weights, which have drifted with prices since then)
+    decisions = get_portfolio_strategy(args.strategy).weights(panel, args.interval).dropna(how="all")
+    w = decisions.iloc[-1].fillna(0.0).clip(lower=0.0)
+    w = w / max(1.0, w.sum())
+    print(f"\nAktuelle Zielgewichte (Entscheidung zum Schluss der Kerze vom {decisions.index[-1]:%d.%m.%Y}):")
     for sym, val in w[w > 0.001].sort_values(ascending=False).items():
         print(f"  {sym:10s} {val:6.1%}")
     print(f"  Cash       {max(0.0, 1 - w.sum()):6.1%}")
