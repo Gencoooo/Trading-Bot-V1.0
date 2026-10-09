@@ -119,3 +119,75 @@ def test_runner_skips_symbols_the_exchange_does_not_offer(tmp_path, monkeypatch)
     report = live.PortfolioBotRunner(EqualWeightHold(), list(data), "1d", broker).step()
     assert report["_rebalanced"] and "BBBUSDT" not in report
     assert broker.balances()["AAA"] > 0
+
+
+class _FakeExchange:
+    """Minimal ccxt stand-in: fixed prices, a free balance and order limits."""
+
+    def __init__(self, prices, balance, min_cost=5.0, fail=()):
+        self.prices, self.balance, self.fail, self.orders = prices, dict(balance), set(fail), []
+        self.markets = {m: {"limits": {"amount": {"min": 0.0}, "cost": {"min": min_cost}}} for m in prices}
+
+    def fetch_ticker(self, m):
+        return {"last": self.prices[m]}
+
+    def fetch_balance(self):
+        return {"free": dict(self.balance)}
+
+    def amount_to_precision(self, m, qty):
+        return f"{qty:.6f}"
+
+    def create_order(self, m, kind, side, amount):
+        if m in self.fail:
+            raise RuntimeError("insufficient balance")
+        base, quote = m.split("/")
+        cost = amount * self.prices[m]
+        if side == "buy":
+            if cost > self.balance.get(quote, 0.0) + 1e-9:
+                raise RuntimeError("insufficient balance")
+            self.balance[quote] -= cost
+            self.balance[base] = self.balance.get(base, 0.0) + amount
+        else:
+            self.balance[base] -= amount
+            self.balance[quote] = self.balance.get(quote, 0.0) + cost
+        self.orders.append((m, side, amount))
+        return {"filled": amount}
+
+
+def _ccxt_broker(ex):
+    broker = live.CCXTBroker.__new__(live.CCXTBroker)
+    broker.quote, broker.ex = "USDT", ex
+    return broker
+
+
+def test_ccxt_buy_is_capped_to_free_balance():
+    ex = _FakeExchange({"AAA/USDT": 10.0}, {"USDT": 100.0})
+    _ccxt_broker(ex).market_order("AAAUSDT", "buy", 50.0)  # would cost 500, only 100 free
+    (_, _, amount), = ex.orders
+    assert amount * 10.0 <= 100.0 and amount == pytest.approx(9.9, rel=1e-6)
+
+
+def test_ccxt_skips_orders_below_exchange_minimum():
+    ex = _FakeExchange({"AAA/USDT": 10.0}, {"USDT": 100.0}, min_cost=5.0)
+    assert _ccxt_broker(ex).market_order("AAAUSDT", "buy", 0.3) == {}  # 3 USDT < 5 USDT minimum
+    assert ex.orders == []
+
+
+def test_portfolio_runner_continues_after_failed_order(tmp_path, monkeypatch):
+    """A failed order is logged, the other coins are still traded and the decision stays pending."""
+    from trading_bot.portfolio_strategies import EqualWeightHold
+    start = (pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=899)).strftime("%Y-%m-%d")
+    data = {"AAAUSDT": synthetic_ohlcv(n=900, interval="1d", seed=11, start=start),
+            "BBBUSDT": synthetic_ohlcv(n=900, interval="1d", seed=12, start=start)}
+    monkeypatch.setattr(live, "fetch_klines", lambda s, *a, **k: data[s])
+    prices = {f"{s[:-4]}/USDT": float(df["close"].iloc[-1]) for s, df in data.items()}
+    ex = _FakeExchange(prices, {"USDT": 1000.0}, fail={"AAA/USDT"})
+    state = tmp_path / "r.runner.json"
+    runner = live.PortfolioBotRunner(EqualWeightHold(), list(data), "1d", _ccxt_broker(ex), state_path=state)
+    report = runner.step()
+    assert report["_failed"] == ["AAAUSDT"]
+    assert ex.balance.get("BBB", 0) > 0          # the other coin was still bought
+    assert not state.exists()                    # decision not marked as done -> retried next run
+    ex.fail.clear()
+    report = runner.step()
+    assert report["_failed"] == [] and ex.balance.get("AAA", 0) > 0 and state.exists()
