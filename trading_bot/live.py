@@ -176,8 +176,30 @@ class CCXTBroker(Broker):
     def price(self, symbol: str) -> float:
         return float(self.ex.fetch_ticker(self._market(symbol))["last"])
 
+    # Reserve for fees and slippage on market buys: a buy never spends more than
+    # (1 - buy_reserve) of the free quote balance, so it cannot fail for lack of funds.
+    buy_reserve: float = 0.01
+
     def market_order(self, symbol: str, side: str, qty: float) -> dict:
         m = self._market(symbol)
+        px = self.price(symbol)
+        if side == "buy":
+            free = self.balances().get(self.quote, 0.0)
+            affordable = free * (1 - self.buy_reserve) / px if px > 0 else 0.0
+            if qty > affordable:
+                log.info("%s: Kauf auf verfügbares Guthaben gekürzt (%.6g statt %.6g)", symbol, affordable, qty)
+                qty = affordable
+        else:
+            qty = min(qty, self.balances().get(self.base_asset(symbol), 0.0))
+        if qty <= 0:
+            return {}
+        limits = (self.ex.markets.get(m) or {}).get("limits") or {}
+        min_amount = (limits.get("amount") or {}).get("min") or 0.0
+        min_cost = (limits.get("cost") or {}).get("min") or 0.0
+        if qty < min_amount or qty * px < min_cost:
+            log.info("%s: Order zu klein für die Börse (%.6g Stück, %.2f %s) - übersprungen",
+                     symbol, qty, qty * px, self.quote)
+            return {}
         amount = float(self.ex.amount_to_precision(m, qty))
         if amount <= 0:
             return {}
@@ -339,6 +361,7 @@ class PortfolioBotRunner:
             return report
         band = getattr(self.strategy, "band", 0.02)
         deltas = {s: target.get(s, 0.0) - holdings[s] / total for s in tradable}
+        failed: list[str] = []
         for s in sorted(tradable, key=lambda k: deltas[k]):  # sells first, then buys
             d = deltas[s]
             if abs(d) < band and not (target[s] == 0 and holdings[s] > 0):
@@ -350,12 +373,27 @@ class PortfolioBotRunner:
             qty = value / prices[s]
             if side == "sell" and target[s] == 0:
                 qty = bal.get(self.broker.base_asset(s), 0.0)
-            fill = self.broker.market_order(s, side, qty) or {}
+            try:
+                fill = self.broker.market_order(s, side, qty) or {}
+            except Exception as exc:  # one failed order must not abort the rest of the rebalance
+                failed.append(s)
+                report[s] = {"target": round(target[s], 3), "was": round(holdings[s] / total, 3),
+                             "action": side, "error": str(exc)}
+                log.error("%s: %s fehlgeschlagen (%s) - weiter mit den übrigen Coins",
+                          s, "Kauf" if side == "buy" else "Verkauf", exc)
+                continue
+            if not fill:
+                continue  # nothing was traded (order too small or nothing to sell)
             filled = float(fill.get("qty", fill.get("filled", qty)) or qty)
             report[s] = {"target": round(target[s], 3), "was": round(holdings[s] / total, 3), "action": side}
             log.info("%s Ziel=%.1f%% vorher=%.1f%% -> %s %.6g", s, target[s] * 100, holdings[s] / total * 100,
                      "Kauf" if side == "buy" else "Verkauf", filled)
-        if self._pending_decision is not None:
+        report["_failed"] = failed
+        if failed:
+            # keep the decision pending: the next run recomputes the gaps and retries them
+            log.warning("%d Order(s) fehlgeschlagen (%s) - werden beim nächsten Lauf nachgeholt.",
+                        len(failed), ", ".join(failed))
+        elif self._pending_decision is not None:
             self._mark_applied(self._pending_decision)
         return report
 
