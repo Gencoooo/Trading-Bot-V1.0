@@ -119,7 +119,27 @@ def _paper_name(args, strat) -> str:
     return args.name or f"paper_{strat.name}_{args.interval}"
 
 
+def _run_label(args) -> str:
+    mode = ("TESTNET" if args.testnet else "LIVE") if args.live else "PAPER"
+    return f"{mode} · {args.strategy}" + (f" [{args.name}]" if args.name else "")
+
+
 def cmd_paper(args) -> None:
+    from .notify import Notifier
+    notifier = Notifier.from_env(_run_label(args))
+    try:
+        _cmd_paper(args, notifier)
+    except SystemExit as exc:  # configuration problems, e.g. missing API keys
+        if isinstance(exc.code, str):
+            notifier.error(exc.code)
+        raise
+    except Exception as exc:
+        if not getattr(exc, "_tb_notified", False):
+            notifier.error(exc)
+        raise
+
+
+def _cmd_paper(args, notifier) -> None:
     from .live import (STATE_DIR, BotRunner, CCXTBroker, PaperBroker, PortfolioBotRunner, next_close_text,
                        next_rebalance_text)
     from .portfolio_strategies import PORTFOLIO_REGISTRY, get_portfolio_strategy
@@ -163,6 +183,7 @@ def cmd_paper(args) -> None:
     if rebalance:
         print(f" Nächste Umschichtung: {rebalance}")
     print("=" * 72)
+    _notify_each_step(runner, notifier, quote)
     if args.once:
         report = runner.step()
         print(f"Kontowert: {report['_equity']:,.2f} {quote}"
@@ -171,6 +192,51 @@ def cmd_paper(args) -> None:
             print("Details: python -m trading_bot status")
     else:
         runner.run_forever()
+
+
+def _notify_each_step(runner, notifier, quote: str) -> None:
+    """Send a phone notification after every decision step (trades, failed orders, crashes)."""
+    if not notifier.enabled:
+        return
+    inner = runner.step
+
+    def step():
+        try:
+            report = inner()
+        except Exception as exc:
+            notifier.error(exc)
+            exc._tb_notified = True
+            raise
+        notifier.report(report, quote)
+        return report
+
+    runner.step = step
+
+
+def cmd_notify(args) -> None:
+    """Set up / test Telegram notifications."""
+    import os
+
+    from .notify import Notifier, find_chat_ids
+    token = os.environ.get("TB_TELEGRAM_TOKEN")
+    if not token:
+        sys.exit("TB_TELEGRAM_TOKEN ist nicht gesetzt. Token von @BotFather holen und mit\n"
+                 "  export TB_TELEGRAM_TOKEN=\"...\"\nsetzen (siehe ANLEITUNG.md, Benachrichtigungen).")
+    chat_id = os.environ.get("TB_TELEGRAM_CHAT_ID")
+    if not chat_id:
+        chats = find_chat_ids(token)
+        if not chats:
+            sys.exit("Noch keine Nachricht gefunden. Schreib deinem Bot in Telegram zuerst eine Nachricht "
+                     "(z. B. /start) und führe den Befehl dann erneut aus.")
+        print("Gefundene Chat-IDs:")
+        for cid, name in chats:
+            print(f"  {cid}   ({name})")
+        print("\nSetze deine ID mit:  export TB_TELEGRAM_CHAT_ID=\"<ID>\"  und starte den Befehl erneut.")
+        return
+    ok = Notifier("Test", token, chat_id).send("✅ Trading-Bot: Benachrichtigungen funktionieren.")
+    if not ok:
+        sys.exit("Senden fehlgeschlagen - Token und Chat-ID prüfen.")
+    print("Testnachricht gesendet. Schau auf dein Handy.")
 
 
 def cmd_status(args) -> None:
@@ -289,6 +355,9 @@ def main(argv: list[str] | None = None) -> None:
     pp.add_argument("--quote", default="USDT",
                     help="Quote-Währung der Handelspaare, z. B. USDC für EU-Konten (Standard: USDT)")
     pp.set_defaults(func=cmd_paper)
+
+    nt = sub.add_parser("notify", help="Telegram-Benachrichtigungen einrichten und testen")
+    nt.set_defaults(func=cmd_notify)
 
     st = sub.add_parser("status", help="Stand eines Paper-Kontos anzeigen")
     st.add_argument("--name", help="Name des Paper-Kontos (Standard: zuletzt benutztes)")
