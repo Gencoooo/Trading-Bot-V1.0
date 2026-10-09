@@ -111,32 +111,115 @@ def cmd_report(args) -> None:
     print(f"Report geschrieben: {path}")
 
 
+def _paper_name(args, strat) -> str:
+    return args.name or f"paper_{strat.name}_{args.interval}"
+
+
 def cmd_paper(args) -> None:
-    from .live import BotRunner, CCXTBroker, PaperBroker, PortfolioBotRunner
+    from .live import (STATE_DIR, BotRunner, CCXTBroker, PaperBroker, PortfolioBotRunner, next_close_text,
+                       next_rebalance_text)
     from .portfolio_strategies import PORTFOLIO_REGISTRY, get_portfolio_strategy
     from .strategies import get_strategy
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%d.%m.%Y %H:%M:%S")
     is_portfolio = args.strategy in PORTFOLIO_REGISTRY
     strat = get_portfolio_strategy(args.strategy) if is_portfolio else get_strategy(args.strategy)
+    quote = args.quote.upper()
     if args.symbols is None:
-        args.symbols = list(LIVE_UNIVERSE) if is_portfolio else ["BTCUSDT", "ETHUSDT"]
+        bases = [s[:-4] for s in LIVE_UNIVERSE] if is_portfolio else ["BTC", "ETH"]
+        args.symbols = [b + quote for b in bases]
     if args.live:
         if not args.i_understand_the_risks:
             sys.exit("Echtgeld-Handel erfordert zusätzlich --i-understand-the-risks.")
-        broker = CCXTBroker(args.exchange, testnet=args.testnet)
+        broker = CCXTBroker(args.exchange, testnet=args.testnet, quote=quote)
+        name = args.name or f"{'testnet' if args.testnet else 'live'}_{strat.name}_{args.interval}"
+        mode = "TESTNET (Spielgeld an der Börse)" if args.testnet else "LIVE – ECHTES GELD"
     else:
-        broker = PaperBroker(name=args.name or f"paper_{strat.name}_{args.interval}",
-                             starting_cash=args.capital, costs=_costs(args))
+        name = _paper_name(args, strat)
+        if args.reset:
+            for f in (STATE_DIR / f"{name}.json", STATE_DIR / f"{name}.runner.json"):
+                if f.exists():
+                    f.unlink()
+            print(f"Paper-Konto '{name}' zurückgesetzt.")
+        broker = PaperBroker(name=name, starting_cash=args.capital, costs=_costs(args), quote=quote)
+        mode = f"PAPER (simuliert, Zustand in state/{name}.json)"
     if is_portfolio:
-        runner = PortfolioBotRunner(strat, args.symbols, args.interval, broker)
+        runner = PortfolioBotRunner(strat, args.symbols, args.interval, broker, max_capital=args.max_capital,
+                                    state_path=STATE_DIR / f"{name}.runner.json")
     else:
-        runner = BotRunner(strat, args.symbols, args.interval, broker, costs=_costs(args))
+        runner = BotRunner(strat, args.symbols, args.interval, broker, costs=_costs(args),
+                           max_capital=args.max_capital)
+    print("=" * 72)
+    print(f" Modus:      {mode}")
+    print(f" Strategie:  {strat.name}  ({'Portfolio' if is_portfolio else 'je Coin'})")
+    print(f" Zeitebene:  {args.interval}   Coins ({len(args.symbols)}): {', '.join(args.symbols)}")
+    if args.max_capital:
+        print(f" Budget:     höchstens {args.max_capital:,.2f} {quote}")
+    print(f" Nächste Prüfung:      {next_close_text(args.interval)}")
+    rebalance = next_rebalance_text(strat, args.interval) if is_portfolio else None
+    if rebalance:
+        print(f" Nächste Umschichtung: {rebalance}")
+    print("=" * 72)
     if args.once:
         report = runner.step()
-        for k, v in report.items():
-            print(k, v)
+        print(f"Kontowert: {report['_equity']:,.2f} {quote}"
+              + ("" if report.get("_rebalanced", True) else "  (heute kein Umschichtungstermin, keine Orders)"))
+        if not args.live:
+            print("Details: python -m trading_bot status")
     else:
         runner.run_forever()
+
+
+def cmd_status(args) -> None:
+    """Show the state of a paper-trading account."""
+    import json
+
+    from .live import STATE_DIR, latest_price
+    files = sorted(f for f in STATE_DIR.glob("*.json") if not f.name.endswith(".runner.json")) \
+        if STATE_DIR.exists() else []
+    if args.name is None:
+        if not files:
+            sys.exit("Noch kein Paper-Konto vorhanden. Starte zuerst: python -m trading_bot paper ...")
+        if len(files) > 1:
+            print("Vorhandene Paper-Konten:", ", ".join(f.stem for f in files))
+        path = max(files, key=lambda f: f.stat().st_mtime)
+    else:
+        path = STATE_DIR / f"{args.name}.json"
+        if not path.exists():
+            sys.exit(f"Kein Paper-Konto '{args.name}' in {STATE_DIR}.")
+    state = json.loads(path.read_text())
+    quote = state.get("quote", "USDT")
+    bal = state.get("balances", {})
+    rows, total = [], max(bal.get(quote, 0.0), 0.0)
+    for asset, qty in bal.items():
+        if asset == quote or qty <= 1e-12:
+            continue
+        try:
+            px = latest_price(f"{asset}{quote}")
+        except RuntimeError:
+            px = float("nan")
+        rows.append((asset, qty, px, qty * px))
+        total += qty * px if px == px else 0.0
+    equity = state.get("equity", [])
+    start = state.get("start_capital") or (equity[0]["equity"] if equity else None)
+    print(f"Paper-Konto: {path.stem}")
+    print(f"Aktueller Wert: {total:,.2f} {quote}", end="")
+    if start:
+        print(f"   (Start {start:,.2f} {quote}, Veränderung {total / start - 1:+.2%})")
+    else:
+        print()
+    print(f"\n{'Coin':8s} {'Menge':>16s} {'Preis':>14s} {'Wert ' + quote:>14s} {'Anteil':>8s}")
+    for asset, qty, px, val in sorted(rows, key=lambda r: -r[3]):
+        print(f"{asset:8s} {qty:16.6f} {px:14.6g} {val:14,.2f} {val / total:8.1%}")
+    cash = max(bal.get(quote, 0.0), 0.0)
+    print(f"{quote:8s} {cash:16.2f} {'':14s} {cash:14,.2f} {cash / total if total else 0:8.1%}")
+    trades = state.get("trades", [])
+    if trades:
+        print(f"\nLetzte Trades (insgesamt {len(trades)}):")
+        for t in trades[-args.trades:]:
+            side = "Kauf   " if t["side"] == "buy" else "Verkauf"
+            print(f"  {t['time'][:16].replace('T', ' ')} UTC  {side} {t['qty']:.6g} {t['symbol']} zu {t['price']:.6g}")
+    if len(equity) > 1:
+        print(f"\nWertverlauf: {len(equity)} Einträge seit {equity[0]['time'][:10]}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -196,7 +279,17 @@ def main(argv: list[str] | None = None) -> None:
     pp.add_argument("--i-understand-the-risks", action="store_true")
     pp.add_argument("--exchange", default="binance")
     pp.add_argument("--testnet", action="store_true", help="Exchange-Testnet benutzen (wenn verfügbar)")
+    pp.add_argument("--max-capital", type=float, default=None,
+                    help="höchstens so viele USDT verwalten (der Rest des Kontos bleibt unberührt)")
+    pp.add_argument("--reset", action="store_true", help="Paper-Konto vor dem Start zurücksetzen")
+    pp.add_argument("--quote", default="USDT",
+                    help="Quote-Währung der Handelspaare, z. B. USDC für EU-Konten (Standard: USDT)")
     pp.set_defaults(func=cmd_paper)
+
+    st = sub.add_parser("status", help="Stand eines Paper-Kontos anzeigen")
+    st.add_argument("--name", help="Name des Paper-Kontos (Standard: zuletzt benutztes)")
+    st.add_argument("--trades", type=int, default=10, help="Anzahl der angezeigten Trades")
+    st.set_defaults(func=cmd_status)
 
     args = p.parse_args(argv)
     args.func(args)

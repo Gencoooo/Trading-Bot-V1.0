@@ -67,3 +67,14 @@ def test_portfolio_strategies_have_no_lookahead(name):
         part = get_portfolio_strategy(name).run(_panel(n), "1d", Costs()).equity
         np.testing.assert_allclose(part.to_numpy(), full.to_numpy()[:len(part)], rtol=1e-9, atol=1e-6,
                                    err_msg=f"{name} cut={n}")
+
+
+def test_rotation_bot_is_quote_currency_agnostic():
+    """Renaming the pairs from USDT to USDC must not change any decision (incl. the BTC filter)."""
+    from trading_bot.portfolio_strategies import get_portfolio_strategy
+    usdt = _panel()
+    usdc = {s.replace("USDT", "USDC"): df for s, df in usdt.items()}
+    w1 = get_portfolio_strategy("rotation_bot_v1").weights(usdt, "1d")
+    w2 = get_portfolio_strategy("rotation_bot_v1").weights(usdc, "1d")
+    w2.columns = [c.replace("USDC", "USDT") for c in w2.columns]
+    pd.testing.assert_frame_equal(w1, w2[w1.columns])

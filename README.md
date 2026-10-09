@@ -9,6 +9,8 @@ eigenen Bots `rotation_bot_v1` und `trend_bot_v1` eingeflossen.
 > ⚠️ **Keine Anlageberatung.** Krypto-Handel kann zum Totalverlust führen. Alle Ergebnisse sind
 > Backtests; vergangene Ergebnisse garantieren keine zukünftigen. Starte mit Paper-Trading.
 
+**👉 Schritt-für-Schritt-Anleitung zur Nutzung: [ANLEITUNG.md](ANLEITUNG.md)**
+
 ## Ergebnis auf einen Blick
 
 Validierung auf **unberührten Daten (Jan. 2024 – Okt. 2026)**, Tageskerzen, nach Kosten
@@ -101,11 +103,13 @@ python -m trading_bot report --tag meinlauf      # -> reports/meinlauf_rankings.
 python -m trading_bot paper --strategy rotation_bot_v1 --interval 1d          # alle handelbaren Coins
 python -m trading_bot paper --strategy rotation_bot_v1 --interval 1d --once   # nur ein Entscheidungsschritt
 python -m trading_bot paper --strategy trend_bot_v1 --symbols BTCUSDT ETHUSDT --interval 4h
+python -m trading_bot status                                                  # Kontostand des Paper-Kontos
 
 # 7) Live-Trading (echte Orders über ccxt, nur bewusst einschalten!)
 pip install ccxt
 export TB_API_KEY=... TB_API_SECRET=...
-python -m trading_bot paper --live --i-understand-the-risks --strategy rotation_bot_v1 --interval 1d
+python -m trading_bot paper --live --i-understand-the-risks --strategy rotation_bot_v1 --interval 1d \
+    --quote USDC --max-capital 500      # EU: USDC-Paare; höchstens 500 USDC verwalten
 ```
 
 Kosten lassen sich global setzen, z. B. `python -m trading_bot --fee 0.00075 --slippage 0.0002 backtest ...`.

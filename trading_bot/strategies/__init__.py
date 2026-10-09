@@ -11,7 +11,9 @@ def load_all() -> None:
     if _LOADED:
         return
     _LOADED = True
-    from . import classic, freqtrade, tradingview, bots, ml, ensemble  # noqa: F401
+    import importlib
+    for module in ("classic", "freqtrade", "tradingview", "bots", "ml", "ensemble"):
+        importlib.import_module(f"{__name__}.{module}")  # modules register their strategies on import
 
 
 __all__ = ["REGISTRY", "Strategy", "add", "get_strategy", "list_strategies", "load_all"]

@@ -100,13 +100,17 @@ class PaperBroker(Broker):
     starting_cash: float = 10_000.0
     costs: Costs = field(default_factory=Costs)
     state: dict = field(default_factory=dict)
+    quote: str = "USDT"
 
     def __post_init__(self):
         self.path = STATE_DIR / f"{self.name}.json"
         if self.path.exists():
             self.state = json.loads(self.path.read_text())
+            self.quote = self.state.get("quote", self.quote)
         else:
-            self.state = {"balances": {self.quote: self.starting_cash}, "trades": [], "equity": []}
+            self.state = {"quote": self.quote, "start_capital": self.starting_cash,
+                          "created": datetime.now(timezone.utc).isoformat(),
+                          "balances": {self.quote: self.starting_cash}, "trades": [], "equity": []}
             self._save()
 
     def _save(self) -> None:
@@ -126,7 +130,7 @@ class PaperBroker(Broker):
             if cost > bal.get(self.quote, 0.0) + 1e-9:
                 qty = bal.get(self.quote, 0.0) / (fill * (1 + self.costs.fee))
                 cost = qty * fill * (1 + self.costs.fee)
-            bal[self.quote] = bal.get(self.quote, 0.0) - cost
+            bal[self.quote] = max(bal.get(self.quote, 0.0) - cost, 0.0)  # cost is capped to the cash above
             bal[base] = bal.get(base, 0.0) + qty
         else:
             qty = min(qty, bal.get(base, 0.0))
@@ -147,14 +151,16 @@ class PaperBroker(Broker):
 class CCXTBroker(Broker):
     """Real orders via ccxt. Keys: TB_API_KEY / TB_API_SECRET environment variables."""
 
-    def __init__(self, exchange: str = "binance", testnet: bool = False):
+    def __init__(self, exchange: str = "binance", testnet: bool = False, quote: str = "USDT"):
+        self.quote = quote
         try:
             import ccxt
         except ImportError as exc:  # pragma: no cover
-            raise SystemExit("Live trading needs ccxt: pip install ccxt") from exc
+            raise SystemExit("Für Live-Trading wird ccxt benötigt: pip install ccxt") from exc
         key, secret = os.environ.get("TB_API_KEY"), os.environ.get("TB_API_SECRET")
         if not key or not secret:
-            raise SystemExit("Set TB_API_KEY and TB_API_SECRET for live trading.")
+            raise SystemExit("Bitte zuerst die Umgebungsvariablen TB_API_KEY und TB_API_SECRET setzen "
+                             "(siehe ANLEITUNG.md, Teil 4).")
         self.ex = getattr(ccxt, exchange)({"apiKey": key, "secret": secret, "enableRateLimit": True})
         if testnet:
             self.ex.set_sandbox_mode(True)
@@ -181,6 +187,16 @@ class CCXTBroker(Broker):
 # --------------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------------- #
+def _prices(broker: Broker, symbols: list[str]) -> dict[str, float]:
+    """Current prices; symbols the exchange does not offer (e.g. on a testnet) are skipped."""
+    out = {}
+    for sym in symbols:
+        try:
+            out[sym] = broker.price(sym)
+        except Exception as exc:  # unknown market, delisted, network hiccup
+            log.warning("%s: kein Preis verfügbar (%s) - wird diesmal übersprungen", sym, exc)
+    return out
+
 @dataclass
 class BotRunner:
     strategy: Strategy
@@ -191,22 +207,25 @@ class BotRunner:
     min_order_value: float = 10.0      # exchange minimum notional (Binance: ~5-10 USDT)
     rebalance_band: float = 0.05       # ignore exposure changes smaller than this
     costs: Costs = field(default_factory=Costs)
+    max_capital: float | None = None   # manage at most this much quote currency (USDT)
 
     def portfolio_value(self, prices: dict[str, float]) -> float:
         bal = self.broker.balances()
         value = bal.get(self.broker.quote, 0.0)
-        for s in self.symbols:
-            value += bal.get(self.broker.base_asset(s), 0.0) * prices[s]
+        for s, px in prices.items():
+            value += bal.get(self.broker.base_asset(s), 0.0) * px
         return value
 
     def step(self) -> dict:
         """One decision cycle over all symbols (call after each candle close)."""
-        prices = {s: self.broker.price(s) for s in self.symbols}
+        prices = _prices(self.broker, self.symbols)
         total = self.portfolio_value(prices)
-        sleeve = total / len(self.symbols)  # equal-weight sleeves, like the backtests
+        if self.max_capital is not None:
+            total = min(total, self.max_capital)
+        sleeve = total / max(len(prices), 1)  # equal-weight sleeves, like the backtests
         report = {}
         start = pd.Timestamp.now(tz="UTC") - interval_to_timedelta(self.interval) * (self.history_bars + 2)
-        for s in self.symbols:
+        for s in prices:
             df = fetch_klines(s, self.interval, start=start)
             if len(df) < 300:
                 log.warning("%s: not enough history (%d bars)", s, len(df))
@@ -215,17 +234,18 @@ class BotRunner:
             held = self.broker.balances().get(self.broker.base_asset(s), 0.0)
             cur = held * prices[s] / sleeve if sleeve > 0 else 0.0
             delta_value = (want - cur) * sleeve
-            action = "hold"
+            action = "halten"
             if abs(want - cur) >= self.rebalance_band or (want == 0.0 and held > 0):
                 qty = abs(delta_value) / prices[s]
                 if abs(delta_value) >= self.min_order_value:
                     side = "buy" if delta_value > 0 else "sell"
                     if side == "sell" and want == 0.0:
                         qty = held
-                    self.broker.market_order(s, side, qty)
-                    action = f"{side} {qty:.6g}"
+                    fill = self.broker.market_order(s, side, qty) or {}
+                    filled = float(fill.get("qty", fill.get("filled", qty)) or qty)
+                    action = f"{'Kauf' if side == 'buy' else 'Verkauf'} {filled:.6g}"
             report[s] = {"price": prices[s], "target": round(want, 3), "current": round(cur, 3), "action": action}
-            log.info("%s price=%.6g target=%.2f current=%.2f -> %s", s, prices[s], want, cur, action)
+            log.info("%s Preis=%.6g Ziel=%.0f%% aktuell=%.0f%% -> %s", s, prices[s], want * 100, cur * 100, action)
         value = self.portfolio_value(prices)
         if isinstance(self.broker, PaperBroker):
             self.broker.record_equity(value)
@@ -233,19 +253,19 @@ class BotRunner:
         return report
 
     def seconds_to_next_close(self) -> float:
-        step = INTERVAL_MINUTES[self.interval] * 60
-        now = time.time()
-        return step - (now % step) + 5  # a few seconds after the candle closed
+        return seconds_to_next_close(self.interval)
 
     def run_forever(self) -> None:  # pragma: no cover - long running
-        log.info("Bot %s on %s (%s) started", self.strategy.name, ",".join(self.symbols), self.interval)
+        log.info("Bot %s gestartet: %s (%s)", self.strategy.name, ", ".join(self.symbols), self.interval)
         while True:
             try:
-                self.step()
+                report = self.step()
+                log.info("Kontowert: %.2f %s", report["_equity"], self.broker.quote)
             except Exception:  # keep running through transient API errors
-                log.exception("step failed")
-            wait = self.seconds_to_next_close()
-            log.info("next decision in %.0f min", wait / 60)
+                log.exception("Schritt fehlgeschlagen - nächster Versuch zur nächsten Kerze")
+            wait = seconds_to_next_close(self.interval)
+            log.info("Nächste Entscheidung %s (in %s). Beenden mit Strg+C.", next_close_text(self.interval),
+                     _duration(wait))
             time.sleep(max(wait, 1.0))
 
 
@@ -259,10 +279,26 @@ class PortfolioBotRunner:
     broker: Broker
     history_bars: int = 1500
     min_order_value: float = 10.0
+    max_capital: float | None = None   # manage at most this much quote currency (USDT)
+    state_path: Path | None = None     # remembers the last executed decision
+
+    def _last_applied(self) -> pd.Timestamp | None:
+        if self.state_path is None or not self.state_path.exists():
+            return None
+        value = json.loads(self.state_path.read_text()).get("last_decision")
+        return pd.Timestamp(value) if value else None
+
+    def _mark_applied(self, ts: pd.Timestamp) -> None:
+        if self.state_path is not None:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text(json.dumps({"last_decision": ts.isoformat()}))
 
     def target_weights(self, initial_sync: bool = False) -> dict[str, float] | None:
-        """Target weights decided at the last closed candle; None if no rebalance is due.
-        With ``initial_sync`` (empty account) the most recent decision is adopted right away."""
+        """Weights of the most recent rebalancing decision that has not been executed yet.
+        Missed runs are caught up: if the bot was offline on a rebalancing day, the decision
+        is executed on the next run. ``initial_sync`` adopts the latest decision even without
+        a stored state (fresh account)."""
+        self._pending_decision = None
         now = pd.Timestamp.now(tz="UTC")
         step = interval_to_timedelta(self.interval)
         start = now - step * (self.history_bars + 2)
@@ -273,29 +309,37 @@ class PortfolioBotRunner:
             log.warning("no symbol with fresh data - skipping this cycle")
             return None
         w = self.strategy.weights(panel, self.interval)
-        row = w.iloc[-1]
-        if row.isna().all():
-            decided = w.dropna(how="all")
-            if not initial_sync or decided.empty:
-                return None  # no rebalance scheduled at this candle
-            row = decided.iloc[-1]
+        decided = w.dropna(how="all")
+        if decided.empty:
+            return None
+        ts, row = decided.index[-1], decided.iloc[-1]
+        last = self._last_applied()
+        fresh = last is None or ts > last
+        if not (fresh and (last is not None or initial_sync or ts == w.index[-1])):
+            return None  # nothing new to execute
+        self._pending_decision = ts
         row = row.fillna(0.0).clip(lower=0.0)
         if row.sum() > 1.0:
             row = row / row.sum()
         return {s: float(row.get(s, 0.0)) for s in self.symbols}
 
     def step(self) -> dict:
-        prices = {s: self.broker.price(s) for s in self.symbols}
+        prices = _prices(self.broker, self.symbols)
+        tradable = list(prices)
         bal = self.broker.balances()
-        holdings = {s: bal.get(self.broker.base_asset(s), 0.0) * prices[s] for s in self.symbols}
-        total = bal.get(self.broker.quote, 0.0) + sum(holdings.values())
-        target = self.target_weights(initial_sync=sum(holdings.values()) < self.min_order_value)
-        report = {"_equity": total, "_rebalanced": target is not None}
+        holdings = {s: bal.get(self.broker.base_asset(s), 0.0) * prices[s] for s in tradable}
+        account = bal.get(self.broker.quote, 0.0) + sum(holdings.values())
+        total = min(account, self.max_capital) if self.max_capital is not None else account
+        target = self.target_weights(initial_sync=self._last_applied() is None)
+        report = {"_equity": account, "_rebalanced": target is not None}
+        if isinstance(self.broker, PaperBroker):
+            self.broker.record_equity(account)
         if target is None or total <= 0:
+            log.info("Kein neuer Umschichtungstermin - Positionen bleiben unverändert.")
             return report
         band = getattr(self.strategy, "band", 0.02)
-        deltas = {s: target[s] - holdings[s] / total for s in self.symbols}
-        for s in sorted(self.symbols, key=lambda k: deltas[k]):  # sells first, then buys
+        deltas = {s: target.get(s, 0.0) - holdings[s] / total for s in tradable}
+        for s in sorted(tradable, key=lambda k: deltas[k]):  # sells first, then buys
             d = deltas[s]
             if abs(d) < band and not (target[s] == 0 and holdings[s] > 0):
                 continue
@@ -306,21 +350,69 @@ class PortfolioBotRunner:
             qty = value / prices[s]
             if side == "sell" and target[s] == 0:
                 qty = bal.get(self.broker.base_asset(s), 0.0)
-            self.broker.market_order(s, side, qty)
+            fill = self.broker.market_order(s, side, qty) or {}
+            filled = float(fill.get("qty", fill.get("filled", qty)) or qty)
             report[s] = {"target": round(target[s], 3), "was": round(holdings[s] / total, 3), "action": side}
-            log.info("%s target=%.3f was=%.3f -> %s %.6g", s, target[s], holdings[s] / total, side, qty)
-        if isinstance(self.broker, PaperBroker):
-            self.broker.record_equity(total)
+            log.info("%s Ziel=%.1f%% vorher=%.1f%% -> %s %.6g", s, target[s] * 100, holdings[s] / total * 100,
+                     "Kauf" if side == "buy" else "Verkauf", filled)
+        if self._pending_decision is not None:
+            self._mark_applied(self._pending_decision)
         return report
 
     def run_forever(self) -> None:  # pragma: no cover - long running
-        step = INTERVAL_MINUTES[self.interval] * 60
+        log.info("Portfolio-Bot %s gestartet: %d Coins (%s)", getattr(self.strategy, "name", "?"),
+                 len(self.symbols), self.interval)
         while True:
             try:
-                self.step()
+                report = self.step()
+                log.info("Kontowert: %.2f %s", report["_equity"], self.broker.quote)
             except Exception:
-                log.exception("step failed")
-            time.sleep(max(step - (time.time() % step) + 5, 1.0))
+                log.exception("Schritt fehlgeschlagen - nächster Versuch zur nächsten Kerze")
+            wait = seconds_to_next_close(self.interval)
+            log.info("Nächste Prüfung %s (in %s). Beenden mit Strg+C.", next_close_text(self.interval),
+                     _duration(wait))
+            time.sleep(max(wait, 1.0))
 
 
-__all__ = ["BotRunner", "PortfolioBotRunner", "PaperBroker", "CCXTBroker", "target_exposure", "latest_price"]
+def seconds_to_next_close(interval: str, delay: float = 10.0) -> float:
+    """Seconds until a few seconds after the next candle close (candles are aligned to UTC)."""
+    step = INTERVAL_MINUTES[interval] * 60
+    return step - (time.time() % step) + delay
+
+
+def next_close(interval: str) -> pd.Timestamp:
+    """Close time of the candle that is currently forming (UTC)."""
+    step = interval_to_timedelta(interval)
+    return pd.Timestamp.now(tz="UTC").floor(step) + step
+
+
+def _when(ts: pd.Timestamp) -> str:
+    local = ts.tz_convert(datetime.now().astimezone().tzinfo)
+    days = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+    return f"{days[local.dayofweek]}, {local:%d.%m.%Y um %H:%M} Uhr Ortszeit ({ts:%H:%M} UTC)"
+
+
+def next_close_text(interval: str) -> str:
+    return _when(next_close(interval))
+
+
+def next_rebalance_text(strategy, interval: str) -> str | None:
+    """When a calendar-scheduled portfolio strategy trades next (None if not scheduled)."""
+    days = getattr(strategy, "rebalance_days", None)
+    if not days:
+        return None
+    from .portfolio_strategies import _rebalance_mask
+    step = interval_to_timedelta(interval)
+    first_open = next_close(interval) - step
+    opens = pd.date_range(first_open, periods=int(days * 1440 / INTERVAL_MINUTES[interval]) + 2, freq=step)
+    hit = opens[_rebalance_mask(opens, interval, days)]
+    return _when(hit[0] + step) if len(hit) else None
+
+
+def _duration(seconds: float) -> str:
+    h, m = divmod(int(seconds) // 60, 60)
+    return f"{h} h {m} min" if h else f"{m} min"
+
+
+__all__ = ["BotRunner", "PortfolioBotRunner", "PaperBroker", "CCXTBroker", "target_exposure", "latest_price",
+           "next_close_text", "next_rebalance_text"]

@@ -397,11 +397,8 @@ add("demo_leaky_tutorial_rf", LeakyTutorialRF)
 
 
 def torch_available() -> bool:
-    try:
-        import torch  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    import importlib.util
+    return importlib.util.find_spec("torch") is not None
 
 
 __all__ = ["make_features", "WalkForwardStrategy", "torch_available"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Callable
 
 import numpy as np
@@ -27,6 +28,18 @@ def add_portfolio(name: str, cls, description: str | None = None, **params) -> N
 
 def get_portfolio_strategy(name: str) -> PortfolioStrategy:
     return PORTFOLIO_REGISTRY[name]()
+
+
+QUOTES = ("USDT", "USDC", "FDUSD", "BUSD", "EUR", "USD")
+
+
+def _btc_column(close: pd.DataFrame) -> str | None:
+    """Column holding Bitcoin's price, whatever the quote currency (BTCUSDT, BTCUSDC, ...)."""
+    for col in close.columns:
+        if col.startswith("BTC") and col[3:] in QUOTES:
+            return col
+    warnings.warn("BTC regime filter is on, but no BTC pair is in the symbol list - filter skipped")
+    return None
 
 
 def _rebalance_mask(index: pd.DatetimeIndex, interval: str, every_days: float) -> np.ndarray:
@@ -121,8 +134,9 @@ class MomentumRotation(PortfolioStrategy):
         else:
             w = sel.astype(float) / self.top_k
         w = w.clip(upper=self.max_weight)
-        if self.btc_filter and "BTCUSDT" in close:
-            btc = close["BTCUSDT"]
+        btc_col = _btc_column(close) if self.btc_filter else None
+        if btc_col:
+            btc = close[btc_col]
             risk_on = (btc > ta.sma(btc, _bars(self.btc_days, interval))).fillna(False)
             w = w.mul(np.where(risk_on, 1.0, self.btc_scale), axis=0)
         w = w.where(close.notna(), 0.0)
@@ -176,8 +190,9 @@ class TrendPortfolio(PortfolioStrategy):
         # weak breadth (fewer than half of the coins trending) scales the whole book down
         exposure = np.minimum(scale, 1.0) * np.minimum(1.0, breadth * 2)
         w = w.mul(exposure, axis=0).clip(upper=self.max_weight)
-        if self.btc_filter and "BTCUSDT" in close:
-            btc = close["BTCUSDT"]
+        btc_col = _btc_column(close) if self.btc_filter else None
+        if btc_col:
+            btc = close[btc_col]
             risk_on = (btc > ta.sma(btc, _bars(self.btc_days, interval))).reindex(idx).fillna(True)
             w = w.mul(np.where(risk_on, 1.0, self.btc_scale), axis=0)
         w = w.where(close.notna(), 0.0)

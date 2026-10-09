@@ -79,3 +79,43 @@ def test_portfolio_runner_rebalances_to_target(tmp_path, monkeypatch):
     for sym, base in (("AAAUSDT", "AAA"), ("BBBUSDT", "BBB")):
         value = bal[base] * float(data[sym]["close"].iloc[-1])
         assert value == pytest.approx(500.0, rel=1e-6)
+
+
+def test_portfolio_runner_catches_up_missed_rebalance(tmp_path, monkeypatch):
+    """A decision that was not executed (bot offline) is executed on the next run, once."""
+    from trading_bot.portfolio_strategies import EqualWeightHold
+    monkeypatch.setattr(live, "STATE_DIR", tmp_path)
+    start = (pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=899)).strftime("%Y-%m-%d")
+    data = {"AAAUSDC": synthetic_ohlcv(n=900, interval="1d", seed=11, start=start),
+            "BBBUSDC": synthetic_ohlcv(n=900, interval="1d", seed=12, start=start)}
+    monkeypatch.setattr(live, "fetch_klines", lambda s, *a, **k: data[s])
+    monkeypatch.setattr(live, "latest_price", lambda s: float(data[s]["close"].iloc[-1]))
+    broker = live.PaperBroker(name="c", starting_cash=1000.0, costs=Costs(fee=0.0, slippage=0.0), quote="USDC")
+    weekly = EqualWeightHold(rebalance_days=7)
+    state = tmp_path / "c.runner.json"
+    # pretend the last executed decision is three weeks old -> the latest one must be caught up
+    state.write_text('{"last_decision": "%s"}' % (data["AAAUSDC"].index[-22]).isoformat())
+    runner = live.PortfolioBotRunner(weekly, list(data), "1d", broker, state_path=state)
+    assert runner.step()["_rebalanced"]
+    assert broker.balances()["AAA"] > 0 and broker.state["quote"] == "USDC"
+    assert not runner.step()["_rebalanced"]  # same decision is not executed twice
+
+
+def test_runner_skips_symbols_the_exchange_does_not_offer(tmp_path, monkeypatch):
+    from trading_bot.portfolio_strategies import EqualWeightHold
+    monkeypatch.setattr(live, "STATE_DIR", tmp_path)
+    start = (pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=899)).strftime("%Y-%m-%d")
+    data = {"AAAUSDT": synthetic_ohlcv(n=900, interval="1d", seed=11, start=start),
+            "BBBUSDT": synthetic_ohlcv(n=900, interval="1d", seed=12, start=start)}
+    monkeypatch.setattr(live, "fetch_klines", lambda s, *a, **k: data[s])
+
+    def price(symbol):
+        if symbol == "BBBUSDT":
+            raise RuntimeError("market not available on testnet")
+        return float(data[symbol]["close"].iloc[-1])
+
+    monkeypatch.setattr(live, "latest_price", price)
+    broker = live.PaperBroker(name="s", starting_cash=1000.0, costs=Costs(fee=0.0, slippage=0.0))
+    report = live.PortfolioBotRunner(EqualWeightHold(), list(data), "1d", broker).step()
+    assert report["_rebalanced"] and "BBBUSDT" not in report
+    assert broker.balances()["AAA"] > 0
