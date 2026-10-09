@@ -247,7 +247,7 @@ def main(argv: list[str] | None = None) -> None:
     b.set_defaults(func=cmd_backtest)
 
     pf = sub.add_parser("portfolio", help="Portfolio-Strategie (Kapital zwischen Coins verteilt) testen")
-    pf.add_argument("--strategy", default="trend_rotation_v1")
+    pf.add_argument("--strategy", default="rotation_bot_v1")
     pf.add_argument("--symbols", nargs="+", default=list(DEFAULT_UNIVERSE))
     pf.add_argument("--interval", default="1d")
     pf.add_argument("--capital", type=float, default=10_000.0)

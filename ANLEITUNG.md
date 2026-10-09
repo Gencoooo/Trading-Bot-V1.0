@@ -19,6 +19,19 @@ Die Befehle stehen jeweils für **Windows** (PowerShell) und für **macOS/Linux*
 
 ## Teil 1 – Installation (einmalig, ca. 10 Minuten)
 
+> **Schnellweg für Ubuntu/Debian:** Ein Skript erledigt die Schritte 1 bis 7 in einem Rutsch.
+> Es installiert die Pakete, führt die Tests aus, lädt die Daten und rechnet den Backtest.
+> Zum Schluss macht es einen Probelauf im Paper-Trading mit einem Testkonto, das es danach wieder löscht.
+>
+> ```bash
+> sudo apt update && sudo apt install -y git
+> git clone -b claude/trading-bot-v1 https://github.com/Gencoooo/Trading-Bot-V1.0.git
+> cd Trading-Bot-V1.0
+> bash scripts/install_ubuntu.sh          # mit --cron zusätzlich den täglichen Lauf einrichten
+> ```
+>
+> Endet es mit **„Fertig“**, machst du bei Schritt 8 weiter.
+
 ### Schritt 1: Python installieren
 
 Du brauchst **Python 3.11 oder 3.12** (3.10 bis 3.13 funktionieren auch).
@@ -387,6 +400,7 @@ In `bot.log` siehst du später, was der Bot jeweils gemacht hat.
 ## Befehlsübersicht
 
 ```bash
+bash scripts/install_ubuntu.sh                               # Ubuntu: installieren + testen (--cron, --ccxt)
 python -m trading_bot list                                   # alle Bots
 python -m trading_bot fetch --intervals 1d                   # Daten laden
 python -m trading_bot portfolio --strategy rotation_bot_v1   # Backtest Portfolio-Bot

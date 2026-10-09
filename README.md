@@ -77,6 +77,8 @@ pip install -r requirements.txt
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
+Auf Ubuntu/Debian geht es auch in einem Rutsch: `bash scripts/install_ubuntu.sh` installiert und testet alles (siehe [ANLEITUNG.md](ANLEITUNG.md)).
+
 Python ≥ 3.10. Marktdaten kommen von Binances öffentlicher API (kein API-Key nötig) und werden in `data/cache/` zwischengespeichert.
 
 ## Benutzung
