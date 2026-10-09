@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Local market data cache (re-download with `python -m trading_bot fetch`)
+data/cache/
+
+# Paper/live trading runtime state & secrets
+state/
+.env
+*.key
+
+# Scratch output
+reports/_scratch/
+
+# Bot-Protokoll aus dem cron-Lauf
+bot.log
