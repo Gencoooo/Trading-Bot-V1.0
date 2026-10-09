@@ -375,6 +375,36 @@ In `bot.log` siehst du später, was der Bot jeweils gemacht hat.
 
 ---
 
+## Benachrichtigungen aufs Handy (Telegram)
+
+Der Bot kann dir nach jedem Lauf eine Telegram-Nachricht schicken: bei jedem Kauf und Verkauf, bei fehlgeschlagenen Orders und wenn ein Lauf abbricht (z. B. weil sich deine IP geändert hat). Das funktioniert im Paper- und im Live-Modus.
+
+1. **Telegram-Bot anlegen:** In Telegram den Kontakt **@BotFather** öffnen, `/newbot` senden, einen Namen und einen Benutzernamen (endet auf `bot`) wählen. Du bekommst einen **Token** wie `123456789:AA...`.
+2. **Deinem Bot schreiben:** Öffne den neuen Bot über den Link von BotFather und sende ihm `/start`.
+3. **Chat-ID herausfinden** (im Projektordner, Umgebung aktiv):
+
+```
+export TB_TELEGRAM_TOKEN="dein_token"
+python -m trading_bot notify
+```
+
+   Der Befehl zeigt deine Chat-ID an.
+
+4. **Testen:**
+
+```
+export TB_TELEGRAM_CHAT_ID="deine_chat_id"
+python -m trading_bot notify
+```
+
+   Auf dem Handy erscheint „Benachrichtigungen funktionieren“.
+
+5. **Dauerhaft einrichten:** Die beiden `export`-Zeilen in dein Startskript (z. B. `~/start_bot_live.sh`) über die Python-Zeile schreiben. Für Paper-Bots in cron gilt dasselbe: Startskript anlegen oder die Variablen vor den Befehl in der cron-Zeile setzen.
+
+Optional: Mit `export TB_NOTIFY_DAILY=1` kommt auch an Tagen ohne Orders eine kurze Meldung. So merkst du sofort, wenn der Bot gar nicht gelaufen ist (Server aus, cron kaputt).
+
+Bleiben die Variablen leer, sendet der Bot nichts. Ein Fehler beim Senden stoppt den Bot nie.
+
 ## Wartung
 
 | Was | Wie |
@@ -408,5 +438,6 @@ python -m trading_bot backtest --strategy trend_bot_v1 --symbol BTCUSDT --interv
 python -m trading_bot paper --strategy rotation_bot_v1 --interval 1d --once   # ein Paper-Schritt
 python -m trading_bot paper --strategy rotation_bot_v1 --interval 1d          # Paper dauerhaft
 python -m trading_bot status                                 # Paper-Kontostand
+python -m trading_bot notify                                 # Telegram einrichten/testen
 python -m trading_bot paper --help                           # alle Optionen
 ```
