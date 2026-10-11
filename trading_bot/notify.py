@@ -94,7 +94,9 @@ class Notifier:
             _post(self.token, "sendMessage", chat_id=self.chat_id, text=text)
             return True
         except Exception as exc:  # never let a notification break trading
-            log.warning("Telegram-Nachricht konnte nicht gesendet werden: %s", exc)
+            text = str(exc).replace(self.token, "<TOKEN>")  # the token is part of the URL - keep it out of logs
+            hint = " (Token prüfen)" if "404" in text or "401" in text else ""
+            log.warning("Telegram-Nachricht konnte nicht gesendet werden%s: %s", hint, text)
             return False
 
     def report(self, report: dict, quote: str) -> bool:

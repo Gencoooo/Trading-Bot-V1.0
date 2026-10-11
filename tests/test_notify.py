@@ -91,3 +91,12 @@ def test_paper_command_reports_startup_errors(sent, monkeypatch):
     with pytest.raises(SystemExit):
         cli.main(["paper", "--live", "--i-understand-the-risks", "--once"])
     assert len(sent) == 1 and "TB_API_KEY" in sent[0]
+
+
+def test_token_is_not_written_to_the_log(monkeypatch, caplog):
+    def boom(token, method, **data):
+        raise RuntimeError(f"404 Client Error: Not Found for url: https://api.telegram.org/bot{token}/sendMessage")
+    monkeypatch.setattr(notify, "_post", boom)
+    with caplog.at_level("WARNING"):
+        notify.Notifier("x", "123:SECRET", "1").send("hallo")
+    assert "SECRET" not in caplog.text and "<TOKEN>" in caplog.text
