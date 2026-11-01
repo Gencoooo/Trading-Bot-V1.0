@@ -306,6 +306,7 @@ class PortfolioBotRunner:
     max_capital: float | None = None   # manage at most this much quote currency (USDT)
     state_path: Path | None = None     # remembers the last executed decision
     news: object | None = None         # trading_bot.news.NewsGuard: optional risk filter (sell/skip only)
+    news_tilt: float = 0.0             # >0: the news forecast shifts rebalance weights by up to this much
 
     def _state(self) -> dict:
         if self.state_path is None or not self.state_path.exists():
@@ -406,6 +407,14 @@ class PortfolioBotRunner:
                     target[s] = 0.0
                 news_why.update(blocked)
                 report["_news_blocked"] = blocked
+                if self.news_tilt > 0:  # forecast: more of the coins with good news, less of the others
+                    from .forecast import tilt_weights
+                    scores = {s: (c.get("forecast") or {}).get("score", 0.0) for s, c in coin.items()}
+                    target, tilt = tilt_weights(target, scores, self.news_tilt)
+                    for s, (old, new) in tilt.items():
+                        log.info("%s: News-Prognose %+.2f -> Ziel %.1f%% statt %.1f%%", s, scores[s], new * 100,
+                                 old * 100)
+                    report["_news_tilt"] = tilt
             elif total > 0:  # between rebalances: sell held coins with fresh critical news
                 sell = {s: c["reason"] for s, c in coin.items() if c.get("sell") and holdings[s] >= self.min_order_value}
                 if sell:

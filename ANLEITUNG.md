@@ -431,6 +431,14 @@ python -m trading_bot paper ... --news --guard-only --once  # nur der Wächter (
 
 Auf dem Homeserver laufen per cron: News laden (alle 15 Min.), ein Paper-Zwilling `paper_news` mit Filter neben dem bisherigen Paper-Konto ohne Filter (Vergleich in der Homeserver-Übersicht) und – sobald freigegeben – das Live-Konto mit `start_bot_live.sh --news` plus Wächter `start_bot_live.sh --news --guard-only`. Der Wächter und der Tageslauf desselben Kontos laufen nie gleichzeitig (Sperrdatei `state/<konto>.lock`). Wächter-Ausgaben stehen in `news-guard.log`.
 
+### News-Prognose: News auch für Gewinne nutzen (`--news-tilt`)
+
+Zusätzlich zum Filter schätzt der Bot aus den Schlagzeilen, ob ein Coin in den nächsten 24 h eher steigt oder fällt. Jede Schlagzeile bekommt einen Wert von −3 bis +3 aus einer festen Stichwortliste (z. B. ETF-Zulassung +2, Listing auf Coinbase +1,5, Partnerschaft +1, Abflüsse −1, Klage −1,5, Hack −2). Gute Nachrichten zu einem Vorfall („gestohlene Coins ersetzt“, „Klage abgewiesen“) überstimmen die Vorfall-Wörter. Kursberichte („Bitcoin fällt 5 %“) zählen wenig, weil sie nur beschreiben, was schon passiert ist. Je Coin werden die Meldungen der letzten 48 h gemittelt (neuere zählen mehr), wenige oder einseitige Quellen zählen weniger.
+
+Mit `--news-tilt 0.5` verschiebt die Prognose bei der Umschichtung die Gewichte: ein Coin mit guter Prognose bekommt bis zu 1,5-mal so viel, einer mit schlechter bis zu halb so viel. Es werden nur Coins umgewichtet, die die Strategie ohnehin kauft, und insgesamt wird nicht mehr investiert.
+
+**Wichtig:** Die geschätzten Prozente sind nicht geeicht – es gibt keine News-Historie zum Testen. Deshalb speichert der Bot jede Stunde Prognose und Kurs (`state/news_forecasts.jsonl`) und vergleicht sie 24 h später mit dem echten Kurs. Die Trefferquote steht in der Web-Übersicht. Unter etwa 200 Vergleichen ist sie Zufall; liegt sie danach nicht klar über 50 %, sollte `--news-tilt` wieder raus.
+
 ## Wartung
 
 | Was | Wie |

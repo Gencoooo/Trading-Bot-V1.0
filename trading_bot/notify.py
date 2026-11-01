@@ -79,6 +79,9 @@ def _news_lines(report: dict) -> list[str]:
         lines.append("Der Bot verkauft deswegen nichts automatisch - Guthaben auf der Börse selbst prüfen.")
     for sym, why in (report.get("_news_blocked") or {}).items():
         lines.append(f"📰 {sym} wegen News nicht gekauft: {why}")
+    tilt = report.get("_news_tilt") or {}
+    if tilt:
+        lines.append("📈 News-Prognose: " + ", ".join(f"{s} {o * 100:.0f}→{n * 100:.0f} %" for s, (o, n) in tilt.items()))
     return lines
 
 

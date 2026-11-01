@@ -25,6 +25,9 @@ for events that keep hurting for days - exchange collapses, lawsuits, delistings
 Fear & Greed and the overall news mood are shown on the dashboard but not traded: a backtest
 2018-2026 found no Fear & Greed rule that improved rotation_bot_v1 out of sample (ANLEITUNG.md).
 
+On top of the filter, :mod:`trading_bot.forecast` turns the headlines into a short-term estimate per
+coin; with ``--news-tilt`` it shifts the rebalance weights (see there).
+
 Everything fetched is cached in ``state/news.json``; the dashboard reads that file. Network problems
 never stop trading: without fresh news the bot trades exactly as before.
 """
@@ -46,8 +49,12 @@ from pathlib import Path
 
 import requests
 
+from . import forecast as fc
+
 log = logging.getLogger("trading_bot.news")
 NEWS_PATH = Path(__file__).resolve().parent.parent / "state" / "news.json"
+FORECAST_LOG = NEWS_PATH.with_name("news_forecasts.jsonl")
+TICKER_URL = "https://data-api.binance.vision/api/v3/ticker/price"
 
 FEEDS = {
     "Cointelegraph": "https://cointelegraph.com/rss",
@@ -211,7 +218,8 @@ def parse_feed(source: str, xml_text: bytes | str) -> list[dict]:
 def item(source: str, title: str, link: str, when: datetime) -> dict:
     info = classify(title)
     key = hashlib.sha1(f"{source}|{title}".encode()).hexdigest()[:16]
-    return {"id": key, "source": source, "title": title, "link": link, "time": when.isoformat(), **info}
+    return {"id": key, "source": source, "title": title, "link": link, "time": when.isoformat(), **info,
+            **fc.sentiment(title)}
 
 
 def fetch_feeds(session: requests.Session, feeds: dict[str, str] = FEEDS) -> tuple[list[dict], dict]:
@@ -235,6 +243,14 @@ def fetch_fear_greed(session: requests.Session, days: int = 30) -> list[dict]:
     rows = [{"time": datetime.fromtimestamp(int(x["timestamp"]), timezone.utc).isoformat(),
              "value": int(x["value"]), "label": x.get("value_classification", "")} for x in r.json()["data"]]
     return sorted(rows, key=lambda x: x["time"])
+
+
+def fetch_prices(session: requests.Session, bases: list[str]) -> dict[str, float]:
+    """Current USDT prices of ``bases`` (public Binance data, no key)."""
+    symbols = json.dumps([f"{b}USDT" for b in bases], separators=(",", ":"))
+    r = session.get(TICKER_URL, params={"symbols": symbols}, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    return {x["symbol"][:-4]: float(x["price"]) for x in r.json()}
 
 
 def parse_delistings(articles: list[dict]) -> list[dict]:
@@ -278,7 +294,8 @@ def _save(cache: dict, path: Path) -> None:
     os.replace(tmp, path)  # atomic: the dashboard never reads a half-written file
 
 
-def refresh(path: Path = NEWS_PATH, session: requests.Session | None = None, now: datetime | None = None) -> dict:
+def refresh(path: Path = NEWS_PATH, session: requests.Session | None = None, now: datetime | None = None,
+            forecast_log: Path | None = None) -> dict:
     """Fetch all sources, merge with the cached history and save. Never raises for network errors."""
     session = session or requests.Session()
     now = now or datetime.now(timezone.utc)
@@ -304,7 +321,17 @@ def refresh(path: Path = NEWS_PATH, session: requests.Session | None = None, now
                              for x in merged.values() if datetime.fromisoformat(x["time"]) >= cutoff),
                             key=lambda x: x["time"], reverse=True)
     # the current assessment of every tracked coin, for readers without this module (the dashboard)
-    cache["signal"] = coin_signal(cache, [c for c in COINS if c not in STABLECOINS], "binance", list(STABLECOINS), now)
+    bases = [c for c in COINS if c not in STABLECOINS]
+    cache["signal"] = coin_signal(cache, bases, "binance", list(STABLECOINS), now)
+    # record the forecast with today's prices (hourly) and score the ones that are 24 h old
+    if path == NEWS_PATH or forecast_log is not None:
+        log_path = forecast_log or FORECAST_LOG
+        try:
+            prices = fetch_prices(session, bases)
+            fc.record(log_path, {b: c["forecast"] for b, c in cache["signal"]["coins"].items()}, prices, now)
+        except Exception as exc:  # the forecast record is a nice-to-have
+            log.warning("Kurse für die Prognose-Messung nicht abrufbar: %s", exc)
+        cache["forecast_eval"] = fc.evaluate(log_path)
     cache["rules"] = {"min_sources": MIN_SOURCES, "sell_min_sources": SELL_MIN_SOURCES, "block_hours": BLOCK_HOURS,
                       "sell_hours": SELL_HOURS, "delist_days": DELIST_DAYS, "stale_hours": STALE_HOURS}
     _save(cache, path)
@@ -324,6 +351,7 @@ def coin_signal(cache: dict, bases: list[str], exchange: str = "binance", quote:
     items = [dict(x, age_h=(now - datetime.fromisoformat(x["time"])).total_seconds() / 3600)
              for x in cache.get("items", [])]
     items = [x for x in items if x["age_h"] >= -1]  # ignore items dated in the future
+    forecasts = fc.coin_forecast(cache.get("items", []), bases, now)
     coins = {}
     for base in bases:
         mine = [x for x in items if (base in x["coins"] or base in x["subjects"]) and x["age_h"] <= 48]
@@ -331,7 +359,8 @@ def coin_signal(cache: dict, bases: list[str], exchange: str = "binance", quote:
         mood = sum(w * x["score"] for w, x in zip(weights, mine)) / sum(weights) if mine else 0.0
         critical = [x for x in items if base in x["subjects"] and x["age_h"] <= BLOCK_HOURS]
         sources = {x["source"] for x in critical}
-        info = {"mood": round(mood, 2), "headlines": len(mine), "blocked": False, "sell": False, "reason": ""}
+        info = {"mood": round(mood, 2), "headlines": len(mine), "blocked": False, "sell": False, "reason": "",
+                "forecast": forecasts[base]}
         if len(sources) >= MIN_SOURCES:
             cats = sorted({x["category"] for x in critical}, key=lambda c: -sum(x["category"] == c for x in critical))
             onset = max(x["age_h"] for x in critical)
@@ -361,6 +390,7 @@ def coin_signal(cache: dict, bases: list[str], exchange: str = "binance", quote:
     fng = cache.get("fear_greed") or []
     market = {"mood": round(sum(x["score"] for x in day) / len(day), 2) if day else 0.0, "headlines_24h": len(day),
               "fear_greed": fng[-1] if fng else None}
+    market["forecast"] = forecasts["_market"]
     return {"coins": coins, "alerts": alerts, "market": market}
 
 

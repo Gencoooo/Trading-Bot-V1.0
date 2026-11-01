@@ -148,6 +148,10 @@ def _cmd_paper(args, notifier) -> None:
     is_portfolio = args.strategy in PORTFOLIO_REGISTRY
     if (args.news or args.guard_only) and not is_portfolio:
         sys.exit("--news / --guard-only gibt es nur für Portfolio-Strategien (z. B. rotation_bot_v1).")
+    if args.news_tilt and not args.news:
+        sys.exit("--news-tilt braucht --news.")
+    if not 0 <= args.news_tilt <= 1:
+        sys.exit("--news-tilt muss zwischen 0 und 1 liegen (0.5 = Gewicht höchstens ±50 %).")
     if args.guard_only and not (args.news and args.once):
         sys.exit("--guard-only braucht --news und --once (gedacht für häufige cron-Läufe).")
     strat = get_portfolio_strategy(args.strategy) if is_portfolio else get_strategy(args.strategy)
@@ -190,7 +194,8 @@ def _run_account(args, notifier, strat, quote: str, is_portfolio: bool, name: st
             from .news import NewsGuard
             news = NewsGuard(exchange=args.exchange, quote=quote)
         runner = PortfolioBotRunner(strat, args.symbols, args.interval, broker, max_capital=args.max_capital,
-                                    state_path=STATE_DIR / f"{name}.runner.json", news=news)
+                                    state_path=STATE_DIR / f"{name}.runner.json", news=news,
+                                    news_tilt=args.news_tilt)
     else:
         runner = BotRunner(strat, args.symbols, args.interval, broker, costs=_costs(args),
                            max_capital=args.max_capital)
@@ -214,6 +219,8 @@ def _run_account(args, notifier, strat, quote: str, is_portfolio: bool, name: st
         print(f" Nächste Umschichtung: {rebalance}")
     if is_portfolio:
         print(f" News-Filter: {'an (Hack/Delisting/Insolvenz -> nicht kaufen bzw. verkaufen)' if args.news else 'aus'}")
+        if args.news_tilt:
+            print(f" News-Prognose: gewichtet um, höchstens ±{args.news_tilt:.0%} je Coin")
     print("=" * 72)
     _notify_each_step(runner, notifier, quote)
     if args.once:
@@ -435,6 +442,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="Quote-Währung der Handelspaare, z. B. USDC für EU-Konten (Standard: USDT)")
     pp.add_argument("--news", action="store_true",
                     help="News-Filter: Coins mit Hack/Delisting/Insolvenz-Meldungen nicht kaufen bzw. verkaufen")
+    pp.add_argument("--news-tilt", type=float, default=0.0,
+                    help="News-Prognose gewichtet die Umschichtung um, z. B. 0.5 = höchstens ±50 %% je Coin "
+                         "(braucht --news)")
     pp.add_argument("--guard-only", action="store_true",
                     help="nur den News-Wächter laufen lassen (für cron alle 15 Minuten, mit --news --once)")
     pp.set_defaults(func=cmd_paper)
