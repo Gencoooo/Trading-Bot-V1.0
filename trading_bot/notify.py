@@ -41,7 +41,8 @@ def _trades(report: dict) -> tuple[list[str], list[str]]:
             failed.append(f"⚠️ {what} {sym} fehlgeschlagen: {info['error'][:150]}")
         elif action in ("buy", "sell"):  # portfolio runner
             icon, what = ("🟢", "Kauf") if action == "buy" else ("🔴", "Verkauf")
-            done.append(f"{icon} {what} {sym} (Ziel {info.get('target', 0) * 100:.0f} %)")
+            why = f" wegen News: {info['news']}" if info.get("news") else f" (Ziel {info.get('target', 0) * 100:.0f} %)"
+            done.append(f"{icon} {what} {sym}{why}")
         elif action.startswith("Kauf"):  # single-coin runner
             done.append(f"🟢 {sym} {action}")
         elif action.startswith("Verkauf"):
@@ -52,18 +53,33 @@ def _trades(report: dict) -> tuple[list[str], list[str]]:
 def format_report(label: str, report: dict, quote: str, daily: bool = False) -> str | None:
     """Message for one run, or None when nothing worth reporting happened."""
     done, failed = _trades(report)
+    news = _news_lines(report)
     equity = report.get("_equity")
     value = f"Kontowert: {equity:,.2f} {quote}".replace(",", "'") if equity is not None else ""
-    if not done and not failed:
+    if not done and not failed and not news:
         return f"✅ {label}\nKeine Orders heute. {value}".strip() if daily else None
     lines = [f"🤖 {label}"]
+    if news:
+        lines += news
     if done:
-        lines += ["Ausgeführt:", *done]
+        lines += ([""] if news else []) + ["Ausgeführt:", *done]
     if failed:
         lines += ["", *failed, "Wird beim nächsten Lauf nachgeholt."]
     if value:
         lines += ["", value]
     return "\n".join(lines)
+
+
+def _news_lines(report: dict) -> list[str]:
+    """Exchange alerts and coins skipped at a rebalance because of news."""
+    lines = []
+    for a in report.get("_news_alerts") or []:
+        lines.append(f"🚨 News-Warnung {a['subject']}: {a['category']} ({a['count']} Meldungen)\n{a['title']}")
+    if lines:
+        lines.append("Der Bot verkauft deswegen nichts automatisch - Guthaben auf der Börse selbst prüfen.")
+    for sym, why in (report.get("_news_blocked") or {}).items():
+        lines.append(f"📰 {sym} wegen News nicht gekauft: {why}")
+    return lines
 
 
 def format_error(label: str, exc: BaseException | str) -> str:

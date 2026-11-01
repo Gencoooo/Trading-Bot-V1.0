@@ -405,6 +405,32 @@ Optional: Mit `export TB_NOTIFY_DAILY=1` kommt auch an Tagen ohne Orders eine ku
 
 Bleiben die Variablen leer, sendet der Bot nichts. Ein Fehler beim Senden stoppt den Bot nie.
 
+## News-Tracker: Verluste durch schlechte Nachrichten begrenzen
+
+Der Bot kann zusätzlich Krypto-News auswerten (`--news`). Quellen: 7 RSS-Feeds (Cointelegraph, CoinDesk, Decrypt, The Block, CryptoSlate, BeInCrypto, NewsBTC), der Fear & Greed Index und die offiziellen Delisting-Ankündigungen von Binance. Kein API-Key nötig, alles landet in `state/news.json`.
+
+**Was der Filter tut – er kann den Bot nur vorsichtiger machen, nie mutiger:**
+
+| Lage | Wirkung |
+|---|---|
+| Kritische Meldung zu einem Coin (Hack, Delisting, Insolvenz/Auszahlungsstopp, Klage/Verbot, Netzwerk-Ausfall) von **mind. 2 unabhängigen Quellen** in den letzten 72 h | Coin wird bei der Umschichtung **nicht gekauft**, sein Anteil bleibt in USDC/USDT |
+| Dasselbe, aber **frisch (< 24 h)** und von **mind. 3 Quellen** | Ein gehaltener Coin wird **sofort verkauft**, auch zwischen den Umschichtungen (News-Wächter alle 15 Min.) |
+| Offizielle Binance-Delisting-Ankündigung (14 Tage) | Nicht kaufen und verkaufen |
+| Kritische Meldung zur **Börse selbst** oder zum Stablecoin (z. B. Binance-Hack, USDC-Depeg) | Nur **Telegram-Warnung** (einmal pro Tag) – Verkaufen würde dich nur in den Stablecoin auf derselben Börse bringen |
+| Fear & Greed, allgemeine Stimmung | Nur Anzeige. Im Backtest 2018–2026 hat keine Regel damit rotation_bot_v1 verbessert. |
+
+Eine Meldung über eine Börse gilt für die Börse (bei Binance auch für BNB), nicht für jeden genannten Coin: „Bitcoin fällt nach Binance-Hack“ sperrt BTC nicht. Ebenso zählen Coins als Beute („Hacker stiehlt 50 Mio. in Bitcoin“), als Ökosystem („Solana-basiertes Protokoll“) und in Fragen/Meinungsartikeln nicht. Ohne aktuelle News (Netz weg, Cache älter als 6 h) handelt der Bot genau wie ohne Filter.
+
+**Ehrlich:** News sind keine Glaskugel. Beim Binance-Hack am 29.10.2026 fiel BNB um 20:30 UTC von 744 auf 680 – die erste Meldung kam um 21:12. Der Filter schützt vor Ereignissen, die tagelang weiter wehtun (Börsen-Pleiten wie FTX, Klagen wie SEC gegen Ripple, Delistings, Chain-Stillstände), nicht vor dem ersten Kursrutsch.
+
+```bash
+python -m trading_bot news --quote USDC                     # News laden und Einschätzung je Coin zeigen
+python -m trading_bot paper ... --news --once               # Tageslauf mit News-Filter
+python -m trading_bot paper ... --news --guard-only --once  # nur der Wächter (für cron alle 15 Min.)
+```
+
+Auf dem Homeserver laufen per cron: News laden (alle 15 Min.), ein Paper-Zwilling `paper_news` mit Filter neben dem bisherigen Paper-Konto ohne Filter (Vergleich in der Homeserver-Übersicht) und – sobald freigegeben – das Live-Konto mit `start_bot_live.sh --news` plus Wächter `start_bot_live.sh --news --guard-only`. Der Wächter und der Tageslauf desselben Kontos laufen nie gleichzeitig (Sperrdatei `state/<konto>.lock`). Wächter-Ausgaben stehen in `news-guard.log`.
+
 ## Wartung
 
 | Was | Wie |
@@ -439,5 +465,6 @@ python -m trading_bot paper --strategy rotation_bot_v1 --interval 1d --once   # 
 python -m trading_bot paper --strategy rotation_bot_v1 --interval 1d          # Paper dauerhaft
 python -m trading_bot status                                 # Paper-Kontostand
 python -m trading_bot notify                                 # Telegram einrichten/testen
+python -m trading_bot news --quote USDC                      # News-Einschätzung je Coin
 python -m trading_bot paper --help                           # alle Optionen
 ```

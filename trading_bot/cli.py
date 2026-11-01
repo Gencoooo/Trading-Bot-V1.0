@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime
 
 import pandas as pd
 
@@ -140,12 +141,15 @@ def cmd_paper(args) -> None:
 
 
 def _cmd_paper(args, notifier) -> None:
-    from .live import (STATE_DIR, BotRunner, CCXTBroker, PaperBroker, PortfolioBotRunner, next_close_text,
-                       next_rebalance_text)
+    from .live import account_lock
     from .portfolio_strategies import PORTFOLIO_REGISTRY, get_portfolio_strategy
     from .strategies import get_strategy
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%d.%m.%Y %H:%M:%S")
     is_portfolio = args.strategy in PORTFOLIO_REGISTRY
+    if (args.news or args.guard_only) and not is_portfolio:
+        sys.exit("--news / --guard-only gibt es nur für Portfolio-Strategien (z. B. rotation_bot_v1).")
+    if args.guard_only and not (args.news and args.once):
+        sys.exit("--guard-only braucht --news und --once (gedacht für häufige cron-Läufe).")
     strat = get_portfolio_strategy(args.strategy) if is_portfolio else get_strategy(args.strategy)
     quote = args.quote.upper()
     if args.symbols is None:
@@ -154,11 +158,25 @@ def _cmd_paper(args, notifier) -> None:
     if args.live:
         if not args.i_understand_the_risks:
             sys.exit("Echtgeld-Handel erfordert zusätzlich --i-understand-the-risks.")
-        broker = CCXTBroker(args.exchange, testnet=args.testnet, quote=quote)
         name = args.name or f"{'testnet' if args.testnet else 'live'}_{strat.name}_{args.interval}"
-        mode = "TESTNET (Spielgeld an der Börse)" if args.testnet else "LIVE – ECHTES GELD"
     else:
         name = _paper_name(args, strat)
+    # one run per account at a time: the news guard (every 15 min) must not trade while the daily
+    # run is rebalancing the same account. The guard skips a busy account, the daily run waits.
+    with account_lock(name, wait=not args.guard_only) as locked:
+        if not locked:
+            print(f"{datetime.now():%d.%m.%Y %H:%M:%S} News-Wächter: Konto {name} ist gerade beschäftigt - übersprungen")
+            return
+        _run_account(args, notifier, strat, quote, is_portfolio, name)
+
+
+def _run_account(args, notifier, strat, quote: str, is_portfolio: bool, name: str) -> None:
+    from .live import (STATE_DIR, BotRunner, CCXTBroker, PaperBroker, PortfolioBotRunner, next_close_text,
+                       next_rebalance_text, save_snapshot)
+    if args.live:
+        broker = CCXTBroker(args.exchange, testnet=args.testnet, quote=quote)
+        mode = "TESTNET (Spielgeld an der Börse)" if args.testnet else "LIVE – ECHTES GELD"
+    else:
         if args.reset:
             for f in (STATE_DIR / f"{name}.json", STATE_DIR / f"{name}.runner.json"):
                 if f.exists():
@@ -167,11 +185,23 @@ def _cmd_paper(args, notifier) -> None:
         broker = PaperBroker(name=name, starting_cash=args.capital, costs=_costs(args), quote=quote)
         mode = f"PAPER (simuliert, Zustand in state/{name}.json)"
     if is_portfolio:
+        news = None
+        if args.news:
+            from .news import NewsGuard
+            news = NewsGuard(exchange=args.exchange, quote=quote)
         runner = PortfolioBotRunner(strat, args.symbols, args.interval, broker, max_capital=args.max_capital,
-                                    state_path=STATE_DIR / f"{name}.runner.json")
+                                    state_path=STATE_DIR / f"{name}.runner.json", news=news)
     else:
         runner = BotRunner(strat, args.symbols, args.interval, broker, costs=_costs(args),
                            max_capital=args.max_capital)
+    if args.guard_only:  # frequent run: one line, and a notification only when something happened
+        notifier.daily = False
+        _notify_each_step(runner, notifier, quote)
+        report = runner.step(guard_only=True)
+        save_snapshot(STATE_DIR / f"{name}.snapshot.json", broker, args.symbols, report, guard_only=True,
+                      name=name, mode="live" if args.live else "paper", strategy=strat.name, news=True)
+        print(f"{datetime.now():%d.%m.%Y %H:%M:%S} News-Wächter [{name}]: {_guard_summary(report)}")
+        return
     print("=" * 72)
     print(f" Modus:      {mode}")
     print(f" Strategie:  {strat.name}  ({'Portfolio' if is_portfolio else 'je Coin'})")
@@ -182,16 +212,37 @@ def _cmd_paper(args, notifier) -> None:
     rebalance = next_rebalance_text(strat, args.interval) if is_portfolio else None
     if rebalance:
         print(f" Nächste Umschichtung: {rebalance}")
+    if is_portfolio:
+        print(f" News-Filter: {'an (Hack/Delisting/Insolvenz -> nicht kaufen bzw. verkaufen)' if args.news else 'aus'}")
     print("=" * 72)
     _notify_each_step(runner, notifier, quote)
     if args.once:
         report = runner.step()
+        if is_portfolio:
+            save_snapshot(STATE_DIR / f"{name}.snapshot.json", broker, args.symbols, report, name=name,
+                          mode="live" if args.live else "paper", strategy=strat.name, news=bool(args.news))
+        quiet = not report.get("_rebalanced", True) and not report.get("_news_sold")
         print(f"Kontowert: {report['_equity']:,.2f} {quote}"
-              + ("" if report.get("_rebalanced", True) else "  (heute kein Umschichtungstermin, keine Orders)"))
+              + ("  (heute kein Umschichtungstermin, keine Orders)" if quiet else ""))
         if not args.live:
             print("Details: python -m trading_bot status")
     else:
         runner.run_forever()
+
+
+def _guard_summary(report: dict) -> str:
+    if not report.get("_news_ok"):
+        return "keine aktuellen News - nichts geprüft"
+    parts = []
+    sold = report.get("_news_sold") or []
+    failed = report.get("_failed") or []
+    if sold:
+        parts.append(f"wegen News verkauft: {', '.join(s for s in sold if s not in failed) or '-'}")
+    if failed:
+        parts.append(f"Verkauf fehlgeschlagen: {', '.join(failed)}")
+    for a in report.get("_news_alerts") or []:
+        parts.append(f"Warnung {a['subject']}: {a['category']}")
+    return "; ".join(parts) or "keine kritischen News zu gehaltenen Coins"
 
 
 def _notify_each_step(runner, notifier, quote: str) -> None:
@@ -200,9 +251,9 @@ def _notify_each_step(runner, notifier, quote: str) -> None:
         return
     inner = runner.step
 
-    def step():
+    def step(*args, **kwargs):  # passes guard_only=True through
         try:
-            report = inner()
+            report = inner(*args, **kwargs)
         except Exception as exc:
             notifier.error(exc)
             exc._tb_notified = True
@@ -211,6 +262,34 @@ def _notify_each_step(runner, notifier, quote: str) -> None:
         return report
 
     runner.step = step
+
+
+def cmd_news(args) -> None:
+    """Refresh the news cache and show what the news filter currently thinks."""
+    from .news import coin_signal, refresh
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s", datefmt="%d.%m.%Y %H:%M:%S")
+    cache = refresh()
+    if args.quiet:
+        return
+    bases = [s[:-4] for s in LIVE_UNIVERSE]
+    sig = coin_signal(cache, bases, args.exchange, args.quote.upper())
+    ok = [n for n, s in cache["sources"].items() if s["ok"]]
+    bad = [n for n, s in cache["sources"].items() if not s["ok"]]
+    print(f"Quellen OK: {', '.join(ok)}" + (f"   nicht erreichbar: {', '.join(bad)}" if bad else ""))
+    fng = sig["market"]["fear_greed"]
+    if fng:
+        print(f"Fear & Greed: {fng['value']} ({fng['label']})   Stimmung der Schlagzeilen (24 h): "
+              f"{sig['market']['mood']:+.2f} aus {sig['market']['headlines_24h']} Meldungen")
+    for a in sig["alerts"]:
+        print(f"\n!! WARNUNG {a['subject']}: {a['category']}, {a['count']} Meldungen in 24 h, erste {a['since'][:16].replace('T', ' ')} UTC\n   {a['title']}")
+    print(f"\n{'Coin':6s} {'Stimmung':>8s} {'Meldungen':>9s}  Status")
+    for base, c in sorted(sig["coins"].items(), key=lambda kv: kv[1]["mood"]):
+        status = ("VERKAUFEN" if c["sell"] else "nicht kaufen") + f" - {c['reason']}" if c["blocked"] else "ok"
+        print(f"{base:6s} {c['mood']:+8.2f} {c['headlines']:9d}  {status}")
+    print(f"\nNeueste Schlagzeilen ({len(cache['items'])} in den letzten Tagen):")
+    for x in cache["items"][:args.top]:
+        tag = f"[{x['category']}]" if x["category"] else f"[{x['score']:+d}]"
+        print(f"  {x['time'][5:16].replace('T', ' ')}  {tag:12s} {x['source'][:12]:12s} {x['title'][:90]}")
 
 
 def cmd_notify(args) -> None:
@@ -354,7 +433,18 @@ def main(argv: list[str] | None = None) -> None:
     pp.add_argument("--reset", action="store_true", help="Paper-Konto vor dem Start zurücksetzen")
     pp.add_argument("--quote", default="USDT",
                     help="Quote-Währung der Handelspaare, z. B. USDC für EU-Konten (Standard: USDT)")
+    pp.add_argument("--news", action="store_true",
+                    help="News-Filter: Coins mit Hack/Delisting/Insolvenz-Meldungen nicht kaufen bzw. verkaufen")
+    pp.add_argument("--guard-only", action="store_true",
+                    help="nur den News-Wächter laufen lassen (für cron alle 15 Minuten, mit --news --once)")
     pp.set_defaults(func=cmd_paper)
+
+    nw = sub.add_parser("news", help="News laden und die aktuelle Einschätzung je Coin anzeigen")
+    nw.add_argument("--exchange", default="binance")
+    nw.add_argument("--quote", default="USDC")
+    nw.add_argument("--top", type=int, default=15, help="Anzahl der angezeigten Schlagzeilen")
+    nw.add_argument("--quiet", action="store_true", help="nur den Cache aktualisieren (für cron)")
+    nw.set_defaults(func=cmd_news)
 
     nt = sub.add_parser("notify", help="Telegram-Benachrichtigungen einrichten und testen")
     nt.set_defaults(func=cmd_notify)

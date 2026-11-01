@@ -16,5 +16,5 @@ state/
 # Scratch output
 reports/_scratch/
 
-# Bot-Protokoll aus dem cron-Lauf
-bot.log
+# Bot-Protokolle aus den cron-Läufen
+*.log
