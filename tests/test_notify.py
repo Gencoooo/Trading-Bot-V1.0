@@ -100,3 +100,26 @@ def test_token_is_not_written_to_the_log(monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         notify.Notifier("x", "123:SECRET", "1").send("hallo")
     assert "SECRET" not in caplog.text and "<TOKEN>" in caplog.text
+
+
+def test_same_error_is_sent_once_and_recovery_is_announced(sent, tmp_path, monkeypatch):
+    monkeypatch.setattr(notify, "STATE_PATH", tmp_path / "n.json")
+    n = notify.Notifier("LIVE", "t", "c")
+    err = 'AuthenticationError: binance {"code":-2015,"msg":"Invalid API-key, IP"} ts=1793418000123'
+    assert n.error(err)
+    assert not n.error(err.replace("1793418000123", "1793418900456"))  # 15 min later, same error
+    assert n.error("NetworkError: timeout")                              # a different error is sent
+    n.report({"_equity": 1.0}, "USDC")
+    assert any("Läuft wieder normal" in m for m in sent)
+    assert n.error(err)                                                  # after recovery: report again
+
+
+def test_ip_change_is_reported(sent, tmp_path, monkeypatch):
+    monkeypatch.setattr(notify, "STATE_PATH", tmp_path / "n.json")
+    ips = iter(["1.2.3.4", "1.2.3.4", "5.6.7.8"])
+    monkeypatch.setattr(notify, "public_ip", lambda: next(ips))
+    n = notify.Notifier("Server", "t", "c")
+    assert notify.check_public_ip(n) == (None, "1.2.3.4") and not sent   # first run only stores
+    notify.check_public_ip(n)
+    assert notify.check_public_ip(n) == ("1.2.3.4", "5.6.7.8")
+    assert len(sent) == 1 and "5.6.7.8" in sent[0]

@@ -299,6 +299,14 @@ def cmd_news(args) -> None:
         print(f"  {x['time'][5:16].replace('T', ' ')}  {tag:12s} {x['source'][:12]:12s} {x['title'][:90]}")
 
 
+def cmd_ipwatch(args) -> None:
+    """Report a changed public IP (for cron)."""
+    from .notify import Notifier, check_public_ip
+    old, new = check_public_ip(Notifier.from_env("Server"))
+    if new and old != new:
+        print(f"{datetime.now():%d.%m.%Y %H:%M:%S} Öffentliche IP: {old or '-'} -> {new}")
+
+
 def cmd_notify(args) -> None:
     """Set up / test Telegram notifications."""
     import os
@@ -455,6 +463,9 @@ def main(argv: list[str] | None = None) -> None:
     nw.add_argument("--top", type=int, default=15, help="Anzahl der angezeigten Schlagzeilen")
     nw.add_argument("--quiet", action="store_true", help="nur den Cache aktualisieren (für cron)")
     nw.set_defaults(func=cmd_news)
+
+    ip = sub.add_parser("ipwatch", help="Telegram-Nachricht, wenn sich die öffentliche IP ändert (für cron)")
+    ip.set_defaults(func=cmd_ipwatch)
 
     nt = sub.add_parser("notify", help="Telegram-Benachrichtigungen einrichten und testen")
     nt.set_defaults(func=cmd_notify)
