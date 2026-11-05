@@ -16,12 +16,14 @@ Limitation: protective stops are evaluated on candle closes, not tick-by-tick.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -303,17 +305,44 @@ class PortfolioBotRunner:
     min_order_value: float = 10.0
     max_capital: float | None = None   # manage at most this much quote currency (USDT)
     state_path: Path | None = None     # remembers the last executed decision
+    news: object | None = None         # trading_bot.news.NewsGuard: optional risk filter (sell/skip only)
+    news_tilt: float = 0.0             # >0: the news forecast shifts rebalance weights by up to this much
+
+    def _state(self) -> dict:
+        if self.state_path is None or not self.state_path.exists():
+            return {}
+        return json.loads(self.state_path.read_text())
+
+    def _save_state(self, **changes) -> None:
+        if self.state_path is not None:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text(json.dumps({**self._state(), **changes}))
 
     def _last_applied(self) -> pd.Timestamp | None:
-        if self.state_path is None or not self.state_path.exists():
-            return None
-        value = json.loads(self.state_path.read_text()).get("last_decision")
+        value = self._state().get("last_decision")
         return pd.Timestamp(value) if value else None
 
     def _mark_applied(self, ts: pd.Timestamp) -> None:
-        if self.state_path is not None:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(json.dumps({"last_decision": ts.isoformat()}))
+        self._save_state(last_decision=ts.isoformat())
+
+    def _news_signal(self) -> dict | None:
+        if self.news is None:
+            return None
+        try:
+            return self.news.signal([self.broker.base_asset(s) for s in self.symbols])
+        except Exception as exc:  # news is an extra filter - without it the bot trades as before
+            log.warning("News-Filter nicht verfügbar (%s) - diesmal ohne News.", exc)
+            return None
+
+    def _new_alerts(self, signal: dict, repeat_hours: float = 24.0) -> list[dict]:
+        """Exchange / stablecoin alerts not reported in the last ``repeat_hours``."""
+        now = pd.Timestamp.now(tz="UTC")
+        seen = self._state().get("alerted", {})
+        fresh = [a for a in signal.get("alerts", [])
+                 if a["id"] not in seen or now - pd.Timestamp(seen[a["id"]]) > pd.Timedelta(hours=repeat_hours)]
+        if fresh:
+            self._save_state(alerted={**seen, **{a["id"]: now.isoformat() for a in fresh}})
+        return fresh
 
     def target_weights(self, initial_sync: bool = False) -> dict[str, float] | None:
         """Weights of the most recent rebalancing decision that has not been executed yet.
@@ -345,19 +374,56 @@ class PortfolioBotRunner:
             row = row / row.sum()
         return {s: float(row.get(s, 0.0)) for s in self.symbols}
 
-    def step(self) -> dict:
+    def step(self, guard_only: bool = False) -> dict:
+        """One cycle: execute a new rebalancing decision if there is one; with ``news`` set, also
+        skip coins with critical news and sell held coins with fresh critical news.
+        ``guard_only`` runs just the news check (for frequent runs between the daily ones)."""
         prices = _prices(self.broker, self.symbols)
         tradable = list(prices)
         bal = self.broker.balances()
         holdings = {s: bal.get(self.broker.base_asset(s), 0.0) * prices[s] for s in tradable}
         account = bal.get(self.broker.quote, 0.0) + sum(holdings.values())
         total = min(account, self.max_capital) if self.max_capital is not None else account
-        target = self.target_weights(initial_sync=self._last_applied() is None)
-        report = {"_equity": account, "_rebalanced": target is not None}
-        if isinstance(self.broker, PaperBroker):
+        self._pending_decision = None
+        target = None if guard_only else self.target_weights(initial_sync=self._last_applied() is None)
+        report = {"_equity": account, "_rebalanced": target is not None,
+                  # a held coin without a price (network outage) is missing from the value
+                  "_equity_complete": all(s in prices for s in self.symbols
+                                          if bal.get(self.broker.base_asset(s), 0.0) > 0)}
+        if isinstance(self.broker, PaperBroker) and not guard_only:
             self.broker.record_equity(account)
+        signal = self._news_signal()
+        news_why: dict[str, str] = {}
+        report["_news_ok"] = signal is not None
+        if signal is not None:
+            report["_news_alerts"] = self._new_alerts(signal)
+            for a in report["_news_alerts"]:
+                log.warning("NEWS-WARNUNG %s: %s - %s", a["subject"], a["category"], a["title"])
+            coin = {s: signal["coins"].get(self.broker.base_asset(s), {}) for s in tradable}
+            if target is not None:  # rebalance: coins with critical news are not bought, their weight stays cash
+                blocked = {s: c["reason"] for s, c in coin.items() if c.get("blocked") and target.get(s, 0) > 0}
+                for s, why in blocked.items():
+                    log.warning("%s: wegen News nicht gekauft (Ziel %.1f%% -> 0%%): %s", s, target[s] * 100, why)
+                    target[s] = 0.0
+                news_why.update(blocked)
+                report["_news_blocked"] = blocked
+                if self.news_tilt > 0:  # forecast: more of the coins with good news, less of the others
+                    from .forecast import tilt_weights
+                    scores = {s: (c.get("forecast") or {}).get("score", 0.0) for s, c in coin.items()}
+                    target, tilt = tilt_weights(target, scores, self.news_tilt)
+                    for s, (old, new) in tilt.items():
+                        log.info("%s: News-Prognose %+.2f -> Ziel %.1f%% statt %.1f%%", s, scores[s], new * 100,
+                                 old * 100)
+                    report["_news_tilt"] = tilt
+            elif total > 0:  # between rebalances: sell held coins with fresh critical news
+                sell = {s: c["reason"] for s, c in coin.items() if c.get("sell") and holdings[s] >= self.min_order_value}
+                if sell:
+                    target = {s: (0.0 if s in sell else holdings[s] / total) for s in tradable}
+                    news_why.update(sell)
+                    report["_news_sold"] = list(sell)
         if target is None or total <= 0:
-            log.info("Kein neuer Umschichtungstermin - Positionen bleiben unverändert.")
+            if not guard_only:
+                log.info("Kein neuer Umschichtungstermin - Positionen bleiben unverändert.")
             return report
         band = getattr(self.strategy, "band", 0.02)
         deltas = {s: target.get(s, 0.0) - holdings[s] / total for s in tradable}
@@ -386,8 +452,10 @@ class PortfolioBotRunner:
                 continue  # nothing was traded (order too small or nothing to sell)
             filled = float(fill.get("qty", fill.get("filled", qty)) or qty)
             report[s] = {"target": round(target[s], 3), "was": round(holdings[s] / total, 3), "action": side}
-            log.info("%s Ziel=%.1f%% vorher=%.1f%% -> %s %.6g", s, target[s] * 100, holdings[s] / total * 100,
-                     "Kauf" if side == "buy" else "Verkauf", filled)
+            if s in news_why:
+                report[s]["news"] = news_why[s]
+            log.info("%s Ziel=%.1f%% vorher=%.1f%% -> %s %.6g%s", s, target[s] * 100, holdings[s] / total * 100,
+                     "Kauf" if side == "buy" else "Verkauf", filled, " (News)" if s in news_why else "")
         report["_failed"] = failed
         if failed:
             # keep the decision pending: the next run recomputes the gaps and retries them
@@ -410,6 +478,80 @@ class PortfolioBotRunner:
             log.info("Nächste Prüfung %s (in %s). Beenden mit Strg+C.", next_close_text(self.interval),
                      _duration(wait))
             time.sleep(max(wait, 1.0))
+
+
+@contextmanager
+def account_lock(name: str, wait: bool = True, timeout: float = 900.0):
+    """Yields True while this process is the only run for account ``name`` (an flock on
+    ``state/<name>.lock``), or False if ``wait`` is off / ``timeout`` passed and it is busy."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_DIR / f"{name}.lock", "w") as fh:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not wait or time.monotonic() > deadline:
+                    yield False
+                    return
+                time.sleep(2)
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _compact_equity(points: list[dict], now: datetime, keep_days: int = 14) -> list[dict]:
+    """All points of the last ``keep_days`` days, before that the last point of each day."""
+    cutoff = (now - timedelta(days=keep_days)).isoformat()
+    daily = {}
+    for p in points:
+        if p["time"] < cutoff:
+            daily[p["time"][:10]] = p
+    return list(daily.values()) + [p for p in points if p["time"] >= cutoff]
+
+
+def save_snapshot(path: Path, broker: Broker, symbols: list[str], report: dict, guard_only: bool = False,
+                  **meta) -> None:
+    """Summary of one run for the dashboard: holdings, value history and the last report.
+    Paper accounts have all of this in their state file; for live accounts it is the only record.
+    A news-guard run (``guard_only``) keeps the daily run's report and log unless it traded."""
+    snap = {"equity": []}
+    if path.exists():
+        try:
+            snap = json.loads(path.read_text())
+        except ValueError:
+            pass
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    bases = {broker.base_asset(s) for s in symbols} | {broker.quote}
+    try:
+        bal = broker.balances()
+        snap["balances"] = {a: q for a, q in bal.items() if a in bases and q > 0}
+    except Exception as exc:  # the snapshot is a nice-to-have
+        log.warning("Kontostand für das Dashboard nicht lesbar: %s", exc)
+    snap.update(meta, updated=now, quote=broker.quote, symbols=list(symbols))
+    if report.get("_equity") is not None and report.get("_equity_complete", True):
+        snap["equity"] = _compact_equity(snap.get("equity", []) + [{"time": now, "equity": report["_equity"]}], now_dt)
+    traded = any(isinstance(v, dict) and v.get("action") for k, v in report.items() if not k.startswith("_"))
+    if guard_only:
+        snap["guard"] = {"time": now, "news_ok": bool(report.get("_news_ok")),
+                         "sold": report.get("_news_sold") or [], "alerts": report.get("_news_alerts") or []}
+    if not guard_only or traded:
+        snap["last_report"] = dict({k: v for k, v in report.items() if k != "_equity"}, _time=now)
+    if not guard_only:
+        snap["daily"] = now
+        try:  # the log file the output is appended to (cron: >> live.log), for the dashboard
+            out = os.path.realpath("/proc/self/fd/1")
+            if os.path.isfile(out):
+                snap["log"] = out
+        except OSError:
+            pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(snap, indent=1, default=str))
+    os.replace(tmp, path)
 
 
 def seconds_to_next_close(interval: str, delay: float = 10.0) -> float:
@@ -453,4 +595,4 @@ def _duration(seconds: float) -> str:
 
 
 __all__ = ["BotRunner", "PortfolioBotRunner", "PaperBroker", "CCXTBroker", "target_exposure", "latest_price",
-           "next_close_text", "next_rebalance_text"]
+           "next_close_text", "next_rebalance_text", "save_snapshot", "account_lock"]
